@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import shlex
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import typer
 from rich.console import Console
@@ -76,12 +78,46 @@ def _parse_event_time(raw: Any) -> datetime | None:
 def _read_events(limit: int | None = None) -> list[dict[str, Any]]:
     if not LOG_FILE.exists():
         return []
-    lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
-    if limit is not None:
-        lines = lines[-limit:]
+
+    if limit is None:
+        return list(_iter_events())
+
+    window: deque[dict[str, Any]] = deque(maxlen=limit)
+    for event in _iter_events():
+        window.append(event)
+    return list(window)
+
+
+def _iter_events() -> Iterator[dict[str, Any]]:
+    if not LOG_FILE.exists():
+        return
+    with LOG_FILE.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                yield parsed
+
+
+def _read_events_from_offset(offset: int) -> tuple[int, list[dict[str, Any]]]:
+    if not LOG_FILE.exists():
+        return 0, []
+
+    with LOG_FILE.open("r", encoding="utf-8", errors="replace") as f:
+        f.seek(offset)
+        content = f.read()
+        new_offset = f.tell()
+
+    if not content:
+        return new_offset, []
 
     events: list[dict[str, Any]] = []
-    for line in lines:
+    for line in content.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -91,7 +127,7 @@ def _read_events(limit: int | None = None) -> list[dict[str, Any]]:
             continue
         if isinstance(parsed, dict):
             events.append(parsed)
-    return events
+    return new_offset, events
 
 
 def _append_event(event: dict[str, Any]) -> None:
@@ -170,7 +206,7 @@ def tail_events(
         console.print("[dim]No log file found.[/dim]")
         return
 
-    last_size = 0
+    last_offset = 0
     try:
         events = _read_events(limit=lines)
         if json_output:
@@ -184,17 +220,18 @@ def tail_events(
         if not follow:
             return
 
-        last_size = LOG_FILE.stat().st_size
+        last_offset = LOG_FILE.stat().st_size
         console.print("[dim]Following log... press Ctrl+C to stop.[/dim]")
         while True:
             time.sleep(interval)
             current_size = LOG_FILE.stat().st_size
-            if current_size <= last_size:
+            if current_size < last_offset:
+                last_offset = 0
+            if current_size <= last_offset:
                 continue
-            last_size = current_size
-            events = _read_events(limit=lines)
+            last_offset, events = _read_events_from_offset(last_offset)
             if events:
-                _print_events_table(events, title=f"🧾 Last {min(lines, len(events))} Events")
+                _print_events_table(events, title=f"🧾 New Events ({len(events)})")
     except KeyboardInterrupt:
         console.print("[dim]Stopped following log.[/dim]")
     except OSError as exc:
@@ -216,19 +253,17 @@ def grep_events(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=2) from exc
 
-    events = _read_events(limit=None)
     matches: list[dict[str, Any]] = []
     needle = keyword.lower()
-
-    for event in reversed(events):
+    window: deque[dict[str, Any]] = deque(maxlen=limit)
+    for event in _iter_events():
         ts = _parse_event_time(event.get("ts"))
         if cutoff is not None and ts is not None and ts < cutoff:
             continue
         blob = json.dumps(event, ensure_ascii=False).lower()
         if needle in blob:
-            matches.append(event)
-            if len(matches) >= limit:
-                break
+            window.append(event)
+    matches = list(window)
 
     if not matches:
         if json_output:
@@ -237,7 +272,6 @@ def grep_events(
         console.print(f"[dim]No events matched '{keyword}'.[/dim]")
         return
 
-    matches.reverse()
     if json_output:
         _emit_json(matches)
         return
@@ -256,13 +290,12 @@ def stats_events(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=2) from exc
 
-    events = _read_events(limit=None)
     total = 0
     failures = 0
     duration_values: list[float] = []
     failed_commands: dict[str, int] = {}
 
-    for event in events:
+    for event in _iter_events():
         ts = _parse_event_time(event.get("ts"))
         if cutoff is not None and ts is not None and ts < cutoff:
             continue
@@ -281,6 +314,8 @@ def stats_events(
             failed = bool(level in {"error", "fatal"})
             if isinstance(exit_code, int) and exit_code != 0:
                 failed = True
+                if isinstance(cmd, list):
+                    cmd = shlex.join(str(part) for part in cmd)
                 if isinstance(cmd, str) and cmd:
                     failed_commands[cmd] = failed_commands.get(cmd, 0) + 1
             if failed:

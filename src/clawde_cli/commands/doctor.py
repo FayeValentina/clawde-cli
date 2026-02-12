@@ -56,7 +56,7 @@ def _result(
     duration_ms = int((time.perf_counter() - started) * 1000)
     return CheckResult(
         id=check_id,
-        ok=severity != "error",
+        ok=severity == "info",
         severity=severity,
         message=message,
         details=details,
@@ -252,42 +252,45 @@ def _check_http(timeout: float) -> CheckResult:
         )
 
 
-def _check_env() -> CheckResult:
+def _mask_env_value(value: str) -> str:
+    if len(value) <= 4:
+        return "*" * len(value)
+    return f"{value[:2]}{'*' * (len(value) - 4)}{value[-2:]}"
+
+
+def _check_env(verbose_values: bool = False) -> CheckResult:
     started = time.perf_counter()
-    proxy_vars = {
-        key: os.getenv(key)
-        for key in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "NO_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "no_proxy",
-        ]
-        if os.getenv(key)
-    }
+    proxy_keys = [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    ]
+    ssl_keys = ["SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"]
 
-    ssl_vars = {
-        key: os.getenv(key)
-        for key in ["SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"]
-        if os.getenv(key)
-    }
+    proxy_values = {key: os.getenv(key) for key in proxy_keys if os.getenv(key)}
+    ssl_values = {key: os.getenv(key) for key in ssl_keys if os.getenv(key)}
 
-    details = {
+    details: dict[str, Any] = {
         "home": str(Path.home()),
-        "proxy_env": proxy_vars,
-        "ssl_env": ssl_vars,
+        "proxy_env": {key: key in proxy_values for key in proxy_keys},
+        "ssl_env": {key: key in ssl_values for key in ssl_keys},
     }
-    return _result("environment", "info", "Environment variables captured", details, started)
+    if verbose_values:
+        details["proxy_env_values"] = {key: _mask_env_value(value) for key, value in proxy_values.items()}
+        details["ssl_env_values"] = {key: _mask_env_value(value) for key, value in ssl_values.items()}
+    return _result("environment", "info", "Environment variable presence captured", details, started)
 
 
-def _run_all_checks(timeout: float, no_network: bool) -> list[CheckResult]:
+def _run_all_checks(timeout: float, no_network: bool, verbose_env: bool) -> list[CheckResult]:
     checks = [
         _check_runtime(),
         _check_dependencies(),
         _check_openclaw_root(),
         _check_workspace(),
-        _check_env(),
+        _check_env(verbose_values=verbose_env),
     ]
     if no_network:
         checks.append(
@@ -330,8 +333,16 @@ def _print_human(results: list[CheckResult]) -> None:
     console.print(table)
 
 
-def _print_json(results: list[CheckResult]) -> None:
-    payload = [asdict(item) for item in results]
+def _print_json(results: list[CheckResult], strict: bool) -> None:
+    has_errors = _has_errors(results)
+    has_warnings = any(item.severity == "warn" for item in results)
+    payload = {
+        "ok": not has_errors and (not strict or not has_warnings),
+        "strict": strict,
+        "has_errors": has_errors,
+        "has_warnings": has_warnings,
+        "results": [asdict(item) for item in results],
+    }
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
@@ -362,14 +373,19 @@ def doctor(
         "--no-network",
         help="Skip DNS/HTTP checks",
     ),
+    verbose_env: bool = typer.Option(
+        False,
+        "--verbose-env",
+        help="Include masked environment variable values in environment check details",
+    ),
 ):
     """Run environment diagnostics."""
     if ctx.invoked_subcommand is not None:
         return
 
-    results = _run_all_checks(timeout=timeout, no_network=no_network)
+    results = _run_all_checks(timeout=timeout, no_network=no_network, verbose_env=verbose_env)
     if json_output:
-        _print_json(results)
+        _print_json(results, strict=strict)
     else:
         _print_human(results)
 

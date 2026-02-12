@@ -38,7 +38,7 @@ def _tail_text(text: str, max_bytes: int) -> str:
     tail_raw = raw[-max_bytes:]
     trimmed = tail_raw.decode("utf-8", errors="replace")
     dropped = len(raw) - len(tail_raw)
-    return f"[truncated {dropped} bytes]\\n{trimmed}"
+    return f"[truncated {dropped} bytes]\n{trimmed}"
 
 
 def _parse_env(env_items: list[str] | None) -> dict[str, str]:
@@ -100,6 +100,7 @@ def _run_once(
             "cmd": cmd_display,
             "cwd": str(cwd.resolve()) if cwd else str(Path.cwd()),
             "exit_code": NOT_FOUND_EXIT_CODE,
+            "not_found": True,
             "timed_out": False,
             "duration_ms": duration_ms,
             "stdout_tail": "",
@@ -114,6 +115,7 @@ def _run_once(
             "cmd": cmd_display,
             "cwd": str(cwd.resolve()) if cwd else str(Path.cwd()),
             "exit_code": 1,
+            "not_found": False,
             "timed_out": False,
             "duration_ms": duration_ms,
             "stdout_tail": "",
@@ -149,6 +151,7 @@ def _run_once(
         "cmd": cmd_display,
         "cwd": str(cwd.resolve()) if cwd else str(Path.cwd()),
         "exit_code": exit_code,
+        "not_found": exit_code == NOT_FOUND_EXIT_CODE,
         "timed_out": timed_out,
         "duration_ms": duration_ms,
         "stdout_tail": _tail_text(stdout, max_bytes=max_bytes),
@@ -162,7 +165,7 @@ def _print_human(result: dict[str, Any]) -> None:
     title_style = "green" if result["exit_code"] == 0 else "red"
     status_line = (
         f"exit={result['exit_code']} | duration={result['duration_ms']}ms"
-        f" | timed_out={result['timed_out']}"
+        f" | timed_out={result['timed_out']} | not_found={result['not_found']}"
     )
     content = [f"[bold]{result['cmd']}[/bold]", status_line]
     if result["stdout_tail"]:
@@ -184,7 +187,7 @@ def run(
     ctx: typer.Context,
     command: list[str] = typer.Argument(
         ...,
-        help="External command to execute",
+        help="External command to execute (use '--' before command when passing command flags)",
     ),
     timeout: float = typer.Option(
         30.0,

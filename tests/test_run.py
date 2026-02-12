@@ -21,6 +21,7 @@ def test_run_json_success():
     assert result.exit_code == 0
     payload = _json_from_output(result.stdout)
     assert payload["exit_code"] == 0
+    assert payload["not_found"] is False
     assert "hello" in payload["stdout_tail"]
 
 
@@ -39,6 +40,7 @@ def test_run_nonzero_exit_code_propagates():
     assert result.exit_code == 3
     payload = _json_from_output(result.stdout)
     assert payload["exit_code"] == 3
+    assert payload["not_found"] is False
     assert "err" in payload["stderr_tail"]
 
 
@@ -52,6 +54,16 @@ def test_run_timeout_returns_124():
     payload = _json_from_output(result.stdout)
     assert payload["timed_out"] is True
     assert payload["exit_code"] == 124
+    assert payload["not_found"] is False
+
+
+def test_run_not_found_sets_flag():
+    result = runner.invoke(app, ["run", "--json", "__not_a_real_command__"])
+
+    assert result.exit_code == 127
+    payload = _json_from_output(result.stdout)
+    assert payload["exit_code"] == 127
+    assert payload["not_found"] is True
 
 
 def test_run_retry_eventually_succeeds(tmp_path):

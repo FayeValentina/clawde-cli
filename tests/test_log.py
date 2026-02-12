@@ -179,3 +179,27 @@ def test_log_stats_json_output(monkeypatch, tmp_path):
     assert payload["total_events"] == 1
     assert payload["failures"] == 1
     assert payload["top_failed_commands"][0]["cmd"] == "bad cmd"
+
+
+def test_log_stats_supports_list_command(monkeypatch, tmp_path):
+    log_file = _configure_log_paths(monkeypatch, tmp_path)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc).isoformat()
+    with log_file.open("w", encoding="utf-8") as f:
+        f.write(
+            json.dumps(
+                {
+                    "ts": now,
+                    "type": "TOOL_CALL",
+                    "level": "error",
+                    "message": "fail",
+                    "data": {"cmd": ["python", "-c", "print(1)"], "exit_code": 2, "duration_ms": 30},
+                }
+            )
+            + "\n"
+        )
+
+    result = runner.invoke(app, ["log", "stats", "--since", "7d", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["top_failed_commands"][0]["cmd"] == "python -c 'print(1)'"
