@@ -1,0 +1,25 @@
+[project]
+name = "clawde-cli"
+version = "0.1.1"
+description = "Clawde's personal CLI toolkit"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.12.0",
+    "rich>=13.0.0",
+    "requests>=2.31.0",
+    "psutil>=5.9.0",
+]
+
+[project.scripts]
+clawde = "clawde_cli.main:app"
+
+[build-system]
+requires = ["uv-build>=0.5.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
