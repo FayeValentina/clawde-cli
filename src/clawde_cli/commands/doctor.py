@@ -28,7 +28,6 @@ OPENCLAW_ROOT = Path.home() / ".openclaw"
 WORKSPACE_DIR = Path.home() / ".openclaw" / "workspace"
 CHECK_DIRS = [
     WORKSPACE_DIR,
-    WORKSPACE_DIR / "notes",
     WORKSPACE_DIR / "memory",
     WORKSPACE_DIR / "logs",
 ]

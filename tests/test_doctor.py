@@ -14,7 +14,7 @@ def _configure_doctor_paths(monkeypatch, tmp_path, create_children: bool) -> Non
     workspace.mkdir(parents=True)
 
     if create_children:
-        for name in ("notes", "memory", "logs"):
+        for name in ("memory", "logs"):
             (workspace / name).mkdir()
 
     monkeypatch.setattr(doctor_cmd, "OPENCLAW_ROOT", openclaw_root)
@@ -22,7 +22,7 @@ def _configure_doctor_paths(monkeypatch, tmp_path, create_children: bool) -> Non
     monkeypatch.setattr(
         doctor_cmd,
         "CHECK_DIRS",
-        [workspace, workspace / "notes", workspace / "memory", workspace / "logs"],
+        [workspace, workspace / "memory", workspace / "logs"],
     )
 
 
