@@ -4,7 +4,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
-from clawde_cli.commands import doctor, extract, log, memory, run, search, system, weather
+from clawde_cli.commands import doctor, extract, generate, log, memory, run, search, system, weather
 
 app = typer.Typer(
     name="clawde",
@@ -22,6 +22,7 @@ app.add_typer(doctor.app, name="doctor", help="Environment diagnostics")
 app.add_typer(run.app, name="run", help="Reliable command execution")
 app.add_typer(log.app, name="log", help="Event log operations")
 app.command(name="search", help="Search session utterances")(search.search_command)
+app.command(name="generate", help="Deterministic nano-banana generation pipeline")(generate.generate_command)
 
 
 @app.callback()
