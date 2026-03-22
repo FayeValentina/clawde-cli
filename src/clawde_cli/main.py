@@ -4,7 +4,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
-from clawde_cli.commands import doctor, extract, log, memory, run, search, system, weather
+from clawde_cli.commands import doctor, extract, log, memory, run, search, stock, system, update, weather
 
 app = typer.Typer(
     name="clawde",
@@ -17,10 +17,12 @@ console = Console()
 app.add_typer(system.app, name="system", help="System status checks")
 app.add_typer(weather.app, name="weather", help="Weather queries")
 app.add_typer(memory.app, name="memory", help="Memory log operations")
+app.add_typer(stock.app, name="stock", help="Stock market analysis & alerts")
 app.add_typer(extract.app, name="extract", help="Extract session utterances")
 app.add_typer(doctor.app, name="doctor", help="Environment diagnostics")
 app.add_typer(run.app, name="run", help="Reliable command execution")
 app.add_typer(log.app, name="log", help="Event log operations")
+app.add_typer(update.app, name="update", help="Update OpenClaw (authorized method)")
 app.command(name="search", help="Search session utterances")(search.search_command)
 
 

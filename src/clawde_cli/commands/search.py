@@ -14,7 +14,7 @@ from rich.table import Table
 console = Console()
 
 DEFAULT_SRC = Path.home() / ".openclaw" / "workspace" / "summaries" / "sessions_text"
-DEFAULT_QMD_COMMAND = Path.home() / ".bun" / "bin" / "qmd"
+DEFAULT_QMD_COMMAND = Path.home() / ".local" / "bin" / "qmd"
 
 
 def _load_records(jsonl_file: Path) -> list[dict[str, Any]]:
