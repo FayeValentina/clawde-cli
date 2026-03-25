@@ -9,83 +9,22 @@ from clawde_cli.main import app
 runner = CliRunner()
 
 
-def test_stock_alert_prints_market_news(monkeypatch):
-    monkeypatch.setattr(
-        stock_cmd,
-        "_build_market_news_overview",
-        lambda display_limit, hours, raw_limit=stock_cmd.DEFAULT_ALERT_RAW_LIMIT: {
-            "matched_news_items": [
-                {
-                    "source": "Reuters",
-                    "title": "Wall Street slips as yields rise",
-                    "summary": "Treasury yields climbed while investors reassessed rate-cut timing.",
-                    "published_at": "2026-03-23T13:00:00Z",
-                    "url": "https://example.com/reuters-story",
-                },
-                {
-                    "source": "Bloomberg",
-                    "title": "AI trade lifts chip stocks",
-                    "summary": "Semiconductor shares outperformed on renewed AI spending optimism.",
-                    "published_at": "2026-03-23T14:30:00Z",
-                    "url": "https://example.com/bloomberg-story",
-                },
-            ],
-            "conclusion": "新闻流多空交织，市场更像事件驱动震荡，交易上宜保持选择性。",
-            "no_match_message": None,
-        },
-    )
-
-    result = runner.invoke(app, ["stock", "alert"])
-
-    assert result.exit_code == 0
-    assert "=== 市场新闻摘要 ===" in result.stdout
-    assert "- [Reuters] Wall Street slips as yields rise" in result.stdout
-    assert "AI trade lifts chip stocks" in result.stdout
-    assert "发布时间:" in result.stdout
-    assert "链接: https://example.com/reuters-story" in result.stdout
-    assert "市场风向结论: 新闻流多空交织，市场更像事件驱动震荡，交易上宜保持选择性。" in result.stdout
-
-
-def test_stock_alert_handles_no_high_relevance_matches(monkeypatch):
-    monkeypatch.setattr(
-        stock_cmd,
-        "_build_market_news_overview",
-        lambda display_limit, hours, raw_limit=stock_cmd.DEFAULT_ALERT_RAW_LIMIT: {
-            "matched_news_items": [],
-            "conclusion": None,
-            "no_match_message": "最近 72 小时未找到高相关度的市场主线新闻，可尝试扩大时间窗口或放宽相关性条件。",
-        },
-    )
-
-    result = runner.invoke(app, ["stock", "alert"])
-
-    assert result.exit_code == 0
-    assert "最近 72 小时暂无高相关度市场主题新闻" in result.stdout
-    assert "最近 72 小时未找到高相关度的市场主线新闻" in result.stdout
-    assert "=== 其他参考新闻 ===" not in result.stdout
-    assert "市场风向结论:" not in result.stdout
-
-
-def test_stock_quote_prints_news_and_ticker_snapshot(monkeypatch):
+def test_stock_quote_prints_ticker_snapshot(monkeypatch):
     captured: dict[str, object] = {}
 
     monkeypatch.setattr(
         stock_cmd,
-        "_fetch_ticker_news",
-        lambda ticker, limit, hours: [
+        "_fetch_fmp_daily_bars",
+        lambda ticker, start: captured.update({"ticker": ticker, "start": start}) or pd.DataFrame(
             {
-                "source": "Reuters",
-                "title": "Nvidia gains on AI demand",
-                "summary": "Investors focused on data-center demand.",
-                "published_at": "2026-03-23T13:00:00Z",
-                "url": "https://example.com/nvda-story",
-            }
-        ],
-    )
-    monkeypatch.setattr(
-        stock_cmd,
-        "_fetch_polygon_daily_bars",
-        lambda ticker, start: captured.setdefault("start", start) or object(),
+                "Open": [1.0],
+                "High": [1.0],
+                "Low": [1.0],
+                "Close": [1.0],
+                "Volume": [1.0],
+            },
+            index=pd.date_range("2026-03-20", periods=1),
+        ),
     )
     monkeypatch.setattr(
         stock_cmd,
@@ -101,13 +40,25 @@ def test_stock_quote_prints_news_and_ticker_snapshot(monkeypatch):
             "dev_ma50": -6.44,
             "rsi14": 37.39,
             "atr_pct": 3.2,
-            "avg_volume_20d": None,
+            "avg_volume_20d": 198907674,
             "rvol": 1.05,
             "drawdown_from_52w_high": -16.58,
-            "drawdown_label": "距 52 周最高价回撤",
+            "drawdown_label": "距 52 周高点回撤",
             "max_drawdown_20d": -11.68,
-            "trend": "弱",
-            "risk": "警戒",
+            "macd": -1.2345,
+            "macd_signal": -0.9876,
+            "macd_hist": -0.2469,
+            "bb_upper": 190.12,
+            "bb_middle": 182.45,
+            "bb_lower": 174.78,
+            "bb_width": 8.41,
+            "bb_percent_b": 0.2213,
+            "adx14": 27.45,
+            "obv": 123456789,
+            "stochrsi_k": 12.34,
+            "stochrsi_d": 23.45,
+            "trend": "偏弱",
+            "risk": "中等偏高",
             "history_warning": None,
         },
     )
@@ -115,14 +66,74 @@ def test_stock_quote_prints_news_and_ticker_snapshot(monkeypatch):
     result = runner.invoke(app, ["stock", "quote", "nvda"])
 
     assert result.exit_code == 0
-    assert captured["start"] == stock_cmd._quote_start_from_lookback()
-    assert "=== NVDA 相关新闻 ===" in result.stdout
-    assert "Nvidia gains on AI demand" in result.stdout
-    assert "发布时间:" in result.stdout
-    assert "[NVDA] 2026-03-20" in result.stdout
+    assert captured["ticker"] == "NVDA"
+    assert captured["start"] == stock_cmd._quote_start_from_lookback(stock_cmd.QUOTE_LOOKBACK_DAYS)
+    assert "NVDA" in result.stdout
     assert "收盘价: 172.70" in result.stdout
-    assert "20 日平均成交量: 暂无" in result.stdout
-    assert "风险标签: 警戒" in result.stdout
+    assert "MACD: -1.2345" in result.stdout
+    assert "OBV: 123,456,789" in result.stdout
+    assert "风险标签: 中等偏高" in result.stdout
+
+
+def test_stock_quote_cli_uses_lookback_days(monkeypatch):
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        stock_cmd,
+        "_fetch_fmp_daily_bars",
+        lambda ticker, start: captured.update({"ticker": ticker, "start": start}) or pd.DataFrame(
+            {
+                "Open": [1.0, 2.0],
+                "High": [1.0, 2.0],
+                "Low": [1.0, 2.0],
+                "Close": [1.0, 2.0],
+                "Volume": [1.0, 2.0],
+            },
+            index=pd.date_range("2026-03-19", periods=2),
+        ),
+    )
+    monkeypatch.setattr(
+        stock_cmd,
+        "_analyze_price_frame",
+        lambda ticker, price_df: {
+            "ticker": ticker,
+            "date": "2026-03-20",
+            "close": 2.0,
+            "day_change_pct": 100.0,
+            "ma20": None,
+            "ma50": None,
+            "dev_ma20": None,
+            "dev_ma50": None,
+            "rsi14": None,
+            "atr_pct": None,
+            "avg_volume_20d": None,
+            "rvol": None,
+            "drawdown_from_52w_high": 0.0,
+            "drawdown_label": "距样本期高点回撤",
+            "max_drawdown_20d": None,
+            "macd": 0.1,
+            "macd_signal": 0.05,
+            "macd_hist": 0.05,
+            "bb_upper": None,
+            "bb_middle": None,
+            "bb_lower": None,
+            "bb_width": None,
+            "bb_percent_b": None,
+            "adx14": None,
+            "obv": 3,
+            "stochrsi_k": None,
+            "stochrsi_d": None,
+            "trend": "样本不足",
+            "risk": "正常",
+            "history_warning": "历史数据仅 2 根，部分技术指标暂不可用",
+        },
+    )
+
+    result = runner.invoke(app, ["stock", "quote", "nvda", "--lookback-days", "300"])
+
+    assert result.exit_code == 0
+    assert captured["ticker"] == "NVDA"
+    assert captured["start"] == stock_cmd._quote_start_from_lookback(300)
 
 
 def test_analyze_price_frame_handles_missing_volume(monkeypatch):
@@ -172,9 +183,9 @@ def test_analyze_price_frame_handles_missing_volume(monkeypatch):
     item = stock_cmd._analyze_price_frame("^VIX", price_df)
 
     assert item["ticker"] == "^VIX"
-    assert item["avg_volume_20d"] is None
+    assert item["avg_volume_20d"] == 0
     assert item["rvol"] is None
-    assert item["drawdown_label"] == "距 52 周最高价回撤"
+    assert item["drawdown_label"] == "距 52 周高点回撤"
 
 
 def test_analyze_price_frame_degrades_for_short_history(monkeypatch):
@@ -225,204 +236,62 @@ def test_analyze_price_frame_degrades_for_short_history(monkeypatch):
 
     assert item["ma20"] is not None
     assert item["ma50"] is None
-    assert item["trend"] in {"偏强", "中性", "偏弱"}
+    assert item["trend"] == "样本不足"
     assert item["history_warning"] is not None
-    assert item["drawdown_label"] == "距样本期最高价回撤"
+    assert item["drawdown_label"] == "距样本期高点回撤"
 
 
-def test_fetch_polygon_daily_bars_normalizes_response(monkeypatch):
-    monkeypatch.setenv("POLYGON_API_KEY", "test-key")
+def test_fetch_fmp_daily_bars_normalizes_response(monkeypatch):
+    monkeypatch.setenv("FMP_API_KEY", "test-key")
 
     class FakeResponse:
         status_code = 200
 
         @staticmethod
         def json():
-            return {
-                "results": [
-                    {"t": 1710806400000, "o": 100.0, "h": 110.0, "l": 99.0, "c": 105.0, "v": 1000},
-                    {"t": 1710892800000, "o": 106.0, "h": 111.0, "l": 104.0, "c": 109.0, "v": 1200},
-                ]
-            }
+            return [
+                {"date": "2024-03-19", "open": 100.0, "high": 110.0, "low": 99.0, "close": 105.0, "volume": 1000},
+                {"date": "2024-03-20", "open": 106.0, "high": 111.0, "low": 104.0, "close": 109.0, "volume": 1200},
+            ]
 
     monkeypatch.setattr(stock_cmd, "requests", SimpleNamespace(get=lambda *args, **kwargs: FakeResponse()))
     monkeypatch.setattr(stock_cmd, "_load_analysis_dependencies", lambda: (pd, None))
 
-    frame = stock_cmd._fetch_polygon_daily_bars("NVDA", "2024-01-01")
+    frame = stock_cmd._fetch_fmp_daily_bars("NVDA", "2024-01-01")
 
     assert list(frame.columns) == ["Open", "High", "Low", "Close", "Volume"]
     assert frame.iloc[0]["Close"] == 105.0
     assert frame.index.is_monotonic_increasing
 
 
-def test_build_market_news_overview_uses_only_matched_items_for_conclusion(monkeypatch):
-    monkeypatch.setattr(
-        stock_cmd,
-        "_fetch_marketaux_news",
-        lambda raw_limit, hours: [
-            {"title": "Fed turns hawkish", "summary": "Markets brace for tighter policy."},
-            {"title": "Company opens new store", "summary": "Retail expansion continues."},
-        ],
-    )
-    monkeypatch.setattr(
-        stock_cmd,
-        "_summarize_market_news",
-        lambda items: f"used:{len(items)}:{items[0]['title']}" if items else None,
-    )
-
-    overview = stock_cmd._build_market_news_overview(display_limit=5, hours=72, raw_limit=75)
-
-    assert overview["conclusion"] == "used:1:Fed turns hawkish"
-    assert len(overview["matched_news_items"]) == 1
-
-
-def test_stock_alert_cli_uses_stable_surface(monkeypatch):
-    captured: dict[str, object] = {}
-
-    monkeypatch.setattr(
-        stock_cmd,
-        "_build_market_news_overview",
-        lambda display_limit, hours, raw_limit=stock_cmd.DEFAULT_ALERT_RAW_LIMIT: captured.update(
-            {"display_limit": display_limit, "hours": hours, "raw_limit": raw_limit}
-        ) or {
-            "matched_news_items": [],
-            "conclusion": None,
-            "no_match_message": None,
-        },
-    )
-
-    result = runner.invoke(app, ["stock", "alert", "--hours", "96", "--limit", "4"])
-
-    assert result.exit_code == 0
-    assert captured == {
-        "display_limit": 4,
-        "hours": 96,
-        "raw_limit": stock_cmd.DEFAULT_ALERT_RAW_LIMIT,
-    }
-
-
-def test_stock_quote_continues_when_news_fetch_fails(monkeypatch):
-    monkeypatch.setattr(
-        stock_cmd,
-        "_fetch_ticker_news",
-        lambda ticker, limit, hours: (_ for _ in ()).throw(RuntimeError("news unavailable")),
-    )
-    monkeypatch.setattr(
-        stock_cmd,
-        "_fetch_polygon_daily_bars",
-        lambda ticker, start: object(),
-    )
-    monkeypatch.setattr(
-        stock_cmd,
-        "_analyze_price_frame",
-        lambda ticker, price_df: {
-            "ticker": ticker,
-            "date": "2026-03-20",
-            "close": 172.7,
-            "day_change_pct": -3.28,
-            "ma20": 183.12,
-            "ma50": 184.59,
-            "dev_ma20": -5.69,
-            "dev_ma50": -6.44,
-            "rsi14": 37.39,
-            "atr_pct": 3.2,
-            "avg_volume_20d": 198907674,
-            "rvol": 1.05,
-            "drawdown_from_52w_high": -16.58,
-            "drawdown_label": "距 52 周最高价回撤",
-            "max_drawdown_20d": -11.68,
-            "trend": "弱",
-            "risk": "警戒",
-            "history_warning": None,
-        },
-    )
-
-    result = runner.invoke(app, ["stock", "quote", "nvda"])
-
-    assert result.exit_code == 0
-    assert "提示: 相关新闻获取失败：" in result.stdout
-    assert "[NVDA] 2026-03-20" in result.stdout
-
-
-def test_stock_quote_cli_uses_lookback_days(monkeypatch):
-    captured: dict[str, object] = {}
-
-    monkeypatch.setattr(stock_cmd, "_fetch_ticker_news", lambda ticker, limit, hours: [])
-    monkeypatch.setattr(
-        stock_cmd,
-        "_fetch_polygon_daily_bars",
-        lambda ticker, start: captured.update({"ticker": ticker, "start": start}) or object(),
-    )
-    monkeypatch.setattr(
-        stock_cmd,
-        "_analyze_price_frame",
-        lambda ticker, price_df: {
-            "ticker": ticker,
-            "date": "2026-03-20",
-            "close": 172.7,
-            "day_change_pct": -3.28,
-            "ma20": 183.12,
-            "ma50": 184.59,
-            "dev_ma20": -5.69,
-            "dev_ma50": -6.44,
-            "rsi14": 37.39,
-            "atr_pct": 3.2,
-            "avg_volume_20d": 198907674,
-            "rvol": 1.05,
-            "drawdown_from_52w_high": -16.58,
-            "drawdown_label": "距 52 周最高价回撤",
-            "max_drawdown_20d": -11.68,
-            "trend": "弱",
-            "risk": "警戒",
-            "history_warning": None,
-        },
-    )
-
-    result = runner.invoke(
-        app,
-        ["stock", "quote", "nvda", "--lookback-days", "300", "--news-hours", "48", "--news-limit", "2"],
-    )
-
-    assert result.exit_code == 0
-    assert captured["ticker"] == "NVDA"
-    assert captured["start"] == stock_cmd._quote_start_from_lookback(300)
-
-
-def test_matches_ticker_news_uses_strict_matching_for_stocks():
-    assert stock_cmd._matches_ticker_news("NVDA", "nvidia guides higher on ai demand")
-    assert not stock_cmd._matches_ticker_news("AMD", "broad market demand improves")
-
-
-def test_matches_ticker_news_allows_thematic_etf_aliases():
-    assert stock_cmd._matches_ticker_news("QQQ", "big tech leads the rally after rate relief")
-    assert stock_cmd._matches_ticker_news("USO", "crude oil prices climb after supply disruption")
-
-
 def test_stock_cli_rejects_invalid_numeric_options():
-    alert_result = runner.invoke(app, ["stock", "alert", "--limit", "0"])
     quote_result = runner.invoke(app, ["stock", "quote", "nvda", "--lookback-days", "0"])
 
-    assert alert_result.exit_code != 0
     assert quote_result.exit_code != 0
 
 
-def test_summarize_market_news_prefers_cautious_bias():
-    news_items = [
-        {"title": "Stocks fall in selloff", "summary": "Risk-off mood returns as sticky inflation stays elevated."},
-        {"title": "Fed seen as hawkish", "summary": "Markets price slower rate cuts and broader decline."},
-    ]
+def test_classify_trend_returns_strong_uptrend():
+    latest = {
+        "close": 110.0,
+        "ma20": 100.0,
+        "ma50": 95.0,
+        "rsi14": 58.0,
+        "macd": 1.2,
+        "macd_signal": 0.9,
+        "adx14": 27.0,
+    }
 
-    summary = stock_cmd._summarize_market_news(news_items)
-
-    assert "偏谨慎" in summary or "承压" in summary
+    assert stock_cmd._classify_trend(latest) == "强势上升"
 
 
-def test_summarize_market_news_does_not_penalize_cooling_inflation():
-    news_items = [
-        {"title": "Cooling inflation helps stocks rally", "summary": "Investors turn bullish as price pressures ease."},
-    ]
+def test_classify_risk_prefers_high_volatility_label():
+    latest = {
+        "atr_pct": 6.5,
+        "rvol": 2.3,
+        "drawdown_from_52w_high": -31.0,
+        "max_drawdown_20d": -13.0,
+        "bb_width": 13.0,
+        "stochrsi_k": 95.0,
+    }
 
-    summary = stock_cmd._summarize_market_news(news_items)
-
-    assert summary is not None
-    assert "偏积极" in summary or "改善" in summary
+    assert stock_cmd._classify_risk(latest) == "高波动"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -21,24 +22,43 @@ console = Console()
 LAUNCHAGENT_LABEL = "ai.openclaw.gateway"
 
 
-def _check_openclaw_installed() -> bool:
-    """Check if openclaw command is available."""
+def _find_openclaw_command() -> str | None:
+    """Return the openclaw executable path if it is present in PATH."""
+    return shutil.which("openclaw")
+
+
+def _probe_openclaw() -> tuple[bool, str | None]:
+    """Check whether openclaw exists and responds sanely.
+
+    Returns:
+        Tuple of (is_usable, error_message)
+    """
+    executable = _find_openclaw_command()
+    if executable is None:
+        return False, "OpenClaw command is not installed or not in PATH."
+
     try:
         subprocess.run(
-            ["openclaw", "--version"],
+            [executable, "--version"],
             capture_output=True,
+            text=True,
             check=True,
         )
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
+        return True, None
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        suffix = f": {detail}" if detail else ""
+        return False, f"OpenClaw command is present but failed to run{suffix}"
+    except FileNotFoundError:
+        return False, "OpenClaw command is not installed or not in PATH."
 
 
 def _get_current_version() -> str:
     """Get current OpenClaw version."""
+    executable = _find_openclaw_command() or "openclaw"
     try:
         result = subprocess.run(
-            ["openclaw", "--version"],
+            [executable, "--version"],
             capture_output=True,
             text=True,
             check=True,
@@ -61,8 +81,9 @@ def _get_uid() -> str:
 
 def _gateway_status_output(timeout: int = 5) -> str:
     """Return raw gateway status output."""
+    executable = _find_openclaw_command() or "openclaw"
     result = subprocess.run(
-        ["openclaw", "gateway", "status"],
+        [executable, "gateway", "status"],
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -189,6 +210,32 @@ def _wait_for_gateway(timeout: int = 30) -> bool:
     return False
 
 
+def _build_gateway_status_summary() -> tuple[str, str]:
+    """Return a compact status label and supporting details for the gateway."""
+    try:
+        status_text = _gateway_status_output(timeout=5)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        return "unknown", f"Unable to query gateway status: {exc}"
+
+    if _gateway_ready_via_service(status_text):
+        return "ready", "LaunchAgent loaded, RPC probe ok, and gateway is listening."
+
+    details = []
+    if _service_is_loaded(status_text):
+        details.append("LaunchAgent loaded")
+    else:
+        details.append("LaunchAgent not loaded")
+    if _rpc_probe_is_ok(status_text):
+        details.append("RPC probe ok")
+    else:
+        details.append("RPC probe failed")
+    if _gateway_is_listening(status_text):
+        details.append("gateway listening")
+    else:
+        details.append("gateway not listening")
+    return "degraded", ", ".join(details)
+
+
 @app.callback()
 def update(
     ctx: typer.Context,
@@ -196,12 +243,12 @@ def update(
         False,
         "--status",
         "-s",
-        help="Check update status without installing",
+        help="Show current version and gateway status without installing",
     ),
     skip_launchagent: bool = typer.Option(
         False,
         "--skip-launchagent",
-        help="Skip LaunchAgent reinstallation (not recommended)",
+        help="Skip LaunchAgent repair and gateway readiness verification",
     ),
 ):
     """Update OpenClaw to the latest version.
@@ -217,11 +264,11 @@ def update(
     if ctx.invoked_subcommand is not None:
         return
 
-    if not _check_openclaw_installed():
+    openclaw_ready, openclaw_error = _probe_openclaw()
+    if not openclaw_ready:
         console.print(
             Panel(
-                "[bold red]OpenClaw is not installed[/bold red]\n"
-                "Please install OpenClaw first before using this command.",
+                f"[bold red]OpenClaw is unavailable[/bold red]\n{openclaw_error}",
                 title="Error",
                 border_style="red",
             )
@@ -229,12 +276,15 @@ def update(
         raise typer.Exit(code=1)
 
     current_version = _get_current_version()
+    gateway_state, gateway_details = _build_gateway_status_summary()
 
     if status_only:
         console.print(
             Panel(
                 f"[bold cyan]Current OpenClaw version:[/bold cyan] {current_version}\n"
-                "Run without --status to check for updates and install.",
+                f"[bold cyan]Gateway status:[/bold cyan] {gateway_state}\n"
+                f"[dim]{gateway_details}[/dim]\n"
+                "Run without --status to update OpenClaw and repair the gateway service.",
                 title="Update Status",
                 border_style="cyan",
             )
@@ -248,14 +298,20 @@ def update(
             "The gateway service will be automatically restarted and verified.",
             title="OpenClaw Update",
             border_style="cyan",
+            )
         )
-    )
+
+    if skip_launchagent:
+        console.print(
+            "[yellow]→ LaunchAgent repair and gateway readiness checks are being skipped by request.[/yellow]"
+        )
 
     console.print("[yellow]→ Running 'openclaw update'...[/yellow]")
 
     try:
+        executable = _find_openclaw_command() or "openclaw"
         result = subprocess.run(
-            ["openclaw", "update"],
+            [executable, "update"],
             capture_output=False,
             text=True,
         )
@@ -303,27 +359,38 @@ def update(
                     )
                 )
 
-        console.print("\n[yellow]→ Waiting for gateway service to become ready...[/yellow]")
-        if _wait_for_gateway(timeout=30):
+        if skip_launchagent:
             console.print(
                 Panel(
-                    "[bold green]✓ OpenClaw is ready![/bold green]\n"
+                    "[bold green]✓ OpenClaw update completed![/bold green]\n"
                     f"Version: {new_version}\n"
-                    "LaunchAgent is loaded and gateway is accepting connections.",
+                    "LaunchAgent repair and gateway verification were skipped.",
                     title="Update Complete",
                     border_style="green",
                 )
             )
         else:
-            console.print(
-                Panel(
-                    "[yellow]⚠ Gateway service verification did not complete in time[/yellow]\n"
-                    "Please check with:\n"
-                    "  openclaw gateway status",
-                    title="Starting",
-                    border_style="yellow",
+            console.print("\n[yellow]→ Waiting for gateway service to become ready...[/yellow]")
+            if _wait_for_gateway(timeout=30):
+                console.print(
+                    Panel(
+                        "[bold green]✓ OpenClaw is ready![/bold green]\n"
+                        f"Version: {new_version}\n"
+                        "LaunchAgent is loaded and gateway is accepting connections.",
+                        title="Update Complete",
+                        border_style="green",
+                    )
                 )
-            )
+            else:
+                console.print(
+                    Panel(
+                        "[yellow]⚠ Gateway service verification did not complete in time[/yellow]\n"
+                        "Please check with:\n"
+                        "  openclaw gateway status",
+                        title="Starting",
+                        border_style="yellow",
+                    )
+                )
 
     except FileNotFoundError:
         console.print(
@@ -342,11 +409,12 @@ def update(
 
 @app.command(name="status")
 def update_status():
-    """Check if an update is available without installing."""
-    if not _check_openclaw_installed():
+    """Show current version and gateway status without installing updates."""
+    openclaw_ready, openclaw_error = _probe_openclaw()
+    if not openclaw_ready:
         console.print(
             Panel(
-                "[bold red]OpenClaw is not installed[/bold red]",
+                f"[bold red]OpenClaw is unavailable[/bold red]\n{openclaw_error}",
                 title="Error",
                 border_style="red",
             )
@@ -354,12 +422,15 @@ def update_status():
         raise typer.Exit(code=1)
 
     current_version = _get_current_version()
+    gateway_state, gateway_details = _build_gateway_status_summary()
 
     console.print(
         Panel(
             f"[bold cyan]Current OpenClaw version:[/bold cyan] {current_version}\n"
-            "[dim]To check for available updates, run:[/dim] clawde update --status",
-            title="Version Info",
+            f"[bold cyan]Gateway status:[/bold cyan] {gateway_state}\n"
+            f"[dim]{gateway_details}[/dim]\n"
+            "[dim]To run the safe wrapper update flow:[/dim] clawde update",
+            title="Status",
             border_style="cyan",
         )
     )

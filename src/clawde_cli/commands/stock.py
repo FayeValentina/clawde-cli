@@ -1,231 +1,77 @@
 from __future__ import annotations
 
-import contextlib
-import importlib
 import os
-import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import requests
 import typer
 from rich.console import Console
 
-app = typer.Typer(help="Stock market analysis & alerts")
+app = typer.Typer(help="Stock quote and technical snapshot")
 console = Console()
 
-QUOTE_LOOKBACK_DAYS = 450
-RSI_WINDOW = 14
-ATR_WINDOW = 14
+# ---------- Constants ----------
+QUOTE_LOOKBACK_DAYS = 260
+REQUEST_TIMEOUT = 20
+
+FMP_HISTORICAL_URL = "https://financialmodelingprep.com/stable/historical-price-eod/full"
+
 MA_SHORT = 20
 MA_LONG = 50
+RSI_WINDOW = 14
+ATR_WINDOW = 14
 VOLUME_WINDOW = 20
 HIGH_52W_WINDOW = 252
 DRAWDOWN_WINDOW = 20
-REQUEST_TIMEOUT = 20
-DEFAULT_ALERT_HOURS = 72
-DEFAULT_ALERT_DISPLAY_LIMIT = 5
-DEFAULT_ALERT_RAW_LIMIT = 75
-DEFAULT_QUOTE_NEWS_HOURS = 72
-DEFAULT_QUOTE_NEWS_LIMIT = 3
-POLYGON_BASE_URL = "https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
-MARKETAUX_NEWS_URL = "https://api.marketaux.com/v1/news/all"
-NEW_YORK_TZ = ZoneInfo("America/New_York")
-MARKET_NEWS_KEYWORDS = [
-    "s&p 500",
-    "nasdaq",
-    "dow",
-    "stocks",
-    "wall street",
-    "market",
-    "fed",
-    "federal reserve",
-    "interest rate",
-    "inflation",
-    "cpi",
-    "pce",
-    "jobs",
-    "earnings",
-    "guidance",
-    "treasury",
-    "treasuries",
-    "yield",
-    "ai",
-    "artificial intelligence",
-    "semiconductor",
-    "chip",
-    "tech",
-    "megacap",
-    "magnificent seven",
-    "risk appetite",
-    "risk-off",
-    "recession fears",
-    "tariff",
-]
-POSITIVE_SENTIMENT_TERMS = [
-    "rally",
-    "surge",
-    "gain",
-    "beat",
-    "bullish",
-    "easing",
-    "cooling inflation",
-    "optimism",
-    "rebound",
-    "upgrade",
-]
-NEGATIVE_SENTIMENT_TERMS = [
-    "selloff",
-    "risk-off",
-    "decline",
-    "drop",
-    "hot inflation",
-    "sticky inflation",
-    "reaccelerating inflation",
-    "hawkish",
-    "tariff",
-    "warning",
-    "downgrade",
-    "recession",
-]
-STRICT_TICKER_ALIASES = {
-    "AAPL": ["aapl", "apple"],
-    "CRCL": ["crcl", "circle", "circle internet group"],
-    "GOOG": ["goog", "google", "alphabet"],
-    "GOOGL": ["googl", "google", "alphabet"],
-    "IBKR": ["ibkr", "interactive brokers", "interactive brokers group"],
-    "NVDA": ["nvda", "nvidia"],
-    "AMD": ["amd", "advanced micro devices"],
-    "MU": ["mu", "micron", "micron technology"],
-    "MSTR": ["mstr", "microstrategy"],
-    "AMZN": ["amzn", "amazon"],
-    "PLTR": ["pltr", "palantir", "palantir technologies"],
-    "NBIS": ["nbis", "nebius", "nebius group"],
-    "AAOI": ["aaoi", "applied optoelectronics", "applied optoelectronics inc"],
-    "LITE": ["lite", "lumentum", "lumentum holdings"],
-    "SAND": ["sand", "sandstorm gold", "sandstorm gold royalties"],
-    "SNDK": ["sndk", "sandisk"],
-    "ASTS": ["asts", "ast spacemobile", "ast space mobile"],
-    "SWMR": ["swmr", "swell medical"],
-    "RKLB": ["rklb", "rocket lab", "rocket lab usa"],
-    "ONDS": ["onds", "ondas", "ondas holdings"],
-    "AEHR": ["aehr", "aehr test systems"],
-    "TSEM": ["tsem", "tower semiconductor", "tower semi"],
-    "POET": ["poet", "poet technologies"],
-    "COHR": ["cohr", "coherent"],
-    "AXTI": ["axti", "axt"],
-    "IREN": ["iren", "iris energy"],
-    "ANET": ["anet", "arista", "arista networks"],
-    "FN": ["fn", "fabrinet"],
-    "GLW": ["glw", "corning"],
-    "MSFT": ["msft", "microsoft"],
-    "META": ["meta", "meta platforms", "facebook"],
-    "TSLA": ["tsla", "tesla"],
-    "NFLX": ["nflx", "netflix"],
-}
-ETF_TICKERS = {"QQQ", "VOO", "SMH", "XOP", "USO"}
-ETF_ALIASES = {
-    "QQQ": [
-        "qqq",
-        "invesco qqq",
-        "nasdaq 100",
-        "nasdaq-100",
-        "ndx",
-        "big tech",
-        "mega-cap tech",
-    ],
-    "VOO": [
-        "voo",
-        "vanguard s&p 500",
-        "s&p 500",
-        "sp500",
-        "large cap us stocks",
-    ],
-    "SMH": [
-        "smh",
-        "van eck semiconductor",
-        "vaneck semiconductor",
-        "semiconductor etf",
-        "semiconductor stocks",
-        "chip stocks",
-        "semis",
-    ],
-    "XOP": [
-        "xop",
-        "s&p oil & gas exploration & production",
-        "oil and gas exploration and production",
-        "exploration and production stocks",
-        "e&p stocks",
-        "oil producers",
-    ],
-    "USO": [
-        "uso",
-        "united states oil fund",
-        "oil etf",
-        "wti crude",
-        "crude oil prices",
-        "oil prices",
-    ],
-}
+
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+
+BB_WINDOW = 20
+BB_STD = 2
+
+STOCH_RSI_WINDOW = 14
+STOCH_RSI_SMOOTH_K = 3
+STOCH_RSI_SMOOTH_D = 3
+
+ADX_WINDOW = 14
 
 
+# ---------- Helpers ----------
 def _load_analysis_dependencies() -> tuple[Any, Any]:
-    """Load pandas and vectorbt lazily for CLI usage."""
     try:
-        pd = importlib.import_module("pandas")
-        vbt = importlib.import_module("vectorbt")
+        import pandas as pd
     except ImportError as exc:
-        raise RuntimeError(
-            "Missing stock dependencies. Install pandas and vectorbt."
-        ) from exc
+        raise RuntimeError("缺少 pandas，请先安装：pip install pandas") from exc
+
+    try:
+        import vectorbt as vbt
+    except ImportError as exc:
+        raise RuntimeError("缺少 vectorbt，请先安装：pip install vectorbt") from exc
+
     return pd, vbt
 
 
-def _pct(value: float) -> float:
-    """Convert a decimal ratio to percentage points."""
-    return round(value * 100, 2)
-
-
-def _quote_start_from_lookback(lookback_days: int = QUOTE_LOOKBACK_DAYS) -> str:
-    """Return a start date derived from a fixed lookback window."""
-    return (datetime.now(UTC).date() - timedelta(days=lookback_days)).isoformat()
-
-
 def _require_env(name: str) -> str:
-    """Return a required environment variable or raise a clear error."""
-    value = os.getenv(name, "").strip()
+    value = os.getenv(name)
     if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
+        raise RuntimeError(f"缺少环境变量 {name}")
     return value
 
 
-def _rolling_max_drawdown(close: Any, window: int) -> Any:
-    """Compute rolling max drawdown over a fixed window."""
-
-    def calc(values: Any) -> float:
-        drawdown = values / values.cummax() - 1
-        return float(drawdown.min())
-
-    return close.rolling(window).apply(calc, raw=False)
+def _pct(value: float) -> float:
+    return value * 100.0
 
 
-def _format_news_timestamp(value: str) -> str | None:
-    """Format an API timestamp into a compact New York market time label."""
-    if not value:
-        return None
-    normalized = value.replace("Z", "+00:00")
-    with contextlib.suppress(ValueError):
-        parsed = datetime.fromisoformat(normalized)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=UTC)
-        ny_time = parsed.astimezone(NEW_YORK_TZ)
-        return ny_time.strftime("%Y-%m-%d %H:%M ET")
-    return value
+def _quote_start_from_lookback(lookback_days: int) -> str:
+    extra_buffer = 120
+    start_date = datetime.now(UTC).date() - timedelta(days=lookback_days + extra_buffer)
+    return start_date.isoformat()
 
 
 def _format_metric(value: object, *, suffix: str = "", digits: int = 2) -> str:
-    """Format numeric metrics while tolerating missing values."""
     if value is None:
         return "暂无"
     if isinstance(value, float):
@@ -233,234 +79,267 @@ def _format_metric(value: object, *, suffix: str = "", digits: int = 2) -> str:
     return f"{value}{suffix}"
 
 
-def _contains_keyword(text: str, keyword: str) -> bool:
-    """Match keywords with simple word boundaries to reduce substring false positives."""
-    escaped = re.escape(keyword.lower()).replace(r"\ ", r"\s+")
-    pattern = rf"(?<![a-z0-9]){escaped}(?![a-z0-9])"
-    return re.search(pattern, text.lower()) is not None
+def _resolve_metric(
+    value: object,
+    *,
+    pd: Any,
+    history_days: int,
+    min_history: int = 0,
+    transform: Any | None = None,
+) -> object:
+    if history_days < min_history or pd.isna(value):
+        return None
+    resolved = float(value)
+    return transform(resolved) if transform is not None else resolved
 
 
-def _contains_alias(text: str, alias: str, *, strict: bool = False) -> bool:
-    """Match ticker symbols or company aliases with configurable strictness."""
-    if strict or " " not in alias:
-        return _contains_keyword(text, alias)
-    return alias.lower() in text.lower()
+def _rolling_max_drawdown(close: Any, window: int) -> Any:
+    def calc(values: Any) -> float:
+        drawdown = values / values.cummax() - 1
+        return float(drawdown.min())
+
+    return close.rolling(window).apply(calc, raw=False)
 
 
-def _is_etf_ticker(ticker: str) -> bool:
-    """Return whether the ticker should use ETF-style thematic news matching."""
-    return ticker.upper() in ETF_TICKERS
-
-
-def _get_news_aliases(ticker: str) -> list[str]:
-    """Return the configured aliases for a ticker."""
-    normalized = ticker.upper()
-    if _is_etf_ticker(normalized):
-        return ETF_ALIASES.get(normalized, [normalized.lower()])
-    return STRICT_TICKER_ALIASES.get(normalized, [normalized.lower()])
-
-
-def _matches_strict_alias(text: str, alias: str) -> bool:
-    """Use boundary-aware matching for stock tickers and aliases."""
-    return _contains_keyword(text, alias)
-
-
-def _matches_etf_alias(text: str, alias: str) -> bool:
-    """Allow broader thematic matching for ETF aliases while keeping token aliases strict."""
-    return _contains_alias(text, alias, strict=False)
-
-
-def _matches_ticker_news(ticker: str, text: str) -> bool:
-    """Apply stock-vs-ETF-specific local relevance matching."""
-    aliases = _get_news_aliases(ticker)
-    matcher = _matches_etf_alias if _is_etf_ticker(ticker) else _matches_strict_alias
-    return any(matcher(text, alias) for alias in aliases)
-
-
-def _fetch_polygon_daily_bars(ticker: str, start: str) -> Any:
-    """Fetch daily OHLCV bars from Polygon and normalize them to a DataFrame."""
+# ---------- Data Fetch ----------
+def _fetch_fmp_daily_bars(ticker: str, start: str) -> Any:
     pd, _ = _load_analysis_dependencies()
-    api_key = _require_env("POLYGON_API_KEY")
-    end = datetime.now(UTC).date().isoformat()
+    api_key = _require_env("FMP_API_KEY")
+
     response = requests.get(
-        POLYGON_BASE_URL.format(ticker=ticker.upper(), start=start, end=end),
+        FMP_HISTORICAL_URL,
         params={
-            "adjusted": "true",
-            "sort": "asc",
-            "limit": 5000,
-            "apiKey": api_key,
+            "symbol": ticker.upper(),
+            "from": start,
+            "to": datetime.now(UTC).date().isoformat(),
+            "apikey": api_key,
         },
         timeout=REQUEST_TIMEOUT,
     )
 
     if response.status_code != 200:
         detail = ""
-        with contextlib.suppress(ValueError):
+        try:
             payload = response.json()
-            detail = payload.get("error") or payload.get("message") or ""
+            if isinstance(payload, dict):
+                detail = payload.get("error") or payload.get("message") or ""
+        except ValueError:
+            pass
         suffix = f": {detail}" if detail else ""
-        raise RuntimeError(f"Polygon request failed with status {response.status_code}{suffix}")
+        raise RuntimeError(f"FMP request failed with status {response.status_code}{suffix}")
 
     payload = response.json()
-    results = payload.get("results") or []
-    if not results:
-        raise ValueError(f"Polygon returned no daily bars for {ticker.upper()}")
+    if not isinstance(payload, list) or not payload:
+        raise ValueError(f"FMP returned no daily bars for {ticker.upper()}")
 
-    frame = pd.DataFrame(results)
-    required = {"o", "h", "l", "c", "v", "t"}
+    frame = pd.DataFrame(payload)
+    required = {"date", "open", "high", "low", "close", "volume"}
     if not required.issubset(frame.columns):
-        raise ValueError(f"Polygon daily bars for {ticker.upper()} are missing expected fields")
+        missing = ", ".join(sorted(required - set(frame.columns)))
+        raise ValueError(f"FMP daily bars for {ticker.upper()} are missing expected fields: {missing}")
 
     frame = frame.rename(
         columns={
-            "o": "Open",
-            "h": "High",
-            "l": "Low",
-            "c": "Close",
-            "v": "Volume",
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
         }
     )
-    frame.index = (
-        pd.to_datetime(frame["t"], unit="ms", utc=True)
-        .dt.tz_convert(NEW_YORK_TZ)
-        .dt.tz_localize(None)
-        .dt.normalize()
-    )
+
+    frame.index = pd.to_datetime(frame["date"]).dt.tz_localize(None).dt.normalize()
     frame = frame[["Open", "High", "Low", "Close", "Volume"]].sort_index()
     frame = frame[~frame.index.duplicated(keep="last")]
+
+    if frame.empty:
+        raise ValueError(f"FMP returned an empty normalized frame for {ticker.upper()}")
+
     return frame
 
 
-def _classify_trend(latest: Any, prev: Any, pd: Any) -> str | None:
-    """Classify the latest technical trend state from available indicators."""
+# ---------- Indicator Calculations ----------
+def _ema(series: Any, span: int) -> Any:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def _compute_macd(close: Any) -> tuple[Any, Any, Any]:
+    ema_fast = _ema(close, MACD_FAST)
+    ema_slow = _ema(close, MACD_SLOW)
+    macd = ema_fast - ema_slow
+    signal = _ema(macd, MACD_SIGNAL)
+    hist = macd - signal
+    return macd, signal, hist
+
+
+def _compute_bollinger(close: Any, pd: Any) -> tuple[Any, Any, Any, Any, Any]:
+    middle = close.rolling(BB_WINDOW, min_periods=BB_WINDOW).mean()
+    std = close.rolling(BB_WINDOW, min_periods=BB_WINDOW).std(ddof=0)
+    upper = middle + BB_STD * std
+    lower = middle - BB_STD * std
+    width = (upper - lower) / middle
+    percent_b = (close - lower) / (upper - lower)
+    percent_b = percent_b.where((upper - lower) != 0, pd.NA)
+    return upper, middle, lower, width, percent_b
+
+
+def _compute_obv(close: Any, volume: Any, pd: Any) -> Any:
+    direction = pd.Series(0.0, index=close.index)
+    direction = direction.mask(close > close.shift(1), 1.0)
+    direction = direction.mask(close < close.shift(1), -1.0)
+    return (direction * volume.fillna(0)).cumsum()
+
+
+def _compute_adx(high: Any, low: Any, close: Any, window: int, pd: Any) -> Any:
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = pd.Series(0.0, index=high.index)
+    minus_dm = pd.Series(0.0, index=high.index)
+
+    plus_dm = plus_dm.mask((up_move > down_move) & (up_move > 0), up_move)
+    minus_dm = minus_dm.mask((down_move > up_move) & (down_move > 0), down_move)
+
+    tr_components = pd.concat(
+        [
+            high - low,
+            (high - close.shift(1)).abs(),
+            (low - close.shift(1)).abs(),
+        ],
+        axis=1,
+    )
+    tr = tr_components.max(axis=1)
+
+    atr = tr.ewm(alpha=1 / window, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / window, adjust=False).mean() / atr
+    minus_di = 100 * minus_dm.ewm(alpha=1 / window, adjust=False).mean() / atr
+
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).abs()) * 100
+    adx = dx.ewm(alpha=1 / window, adjust=False).mean()
+    return adx
+
+
+def _compute_stoch_rsi(close: Any, pd: Any) -> tuple[Any, Any]:
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / RSI_WINDOW, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / RSI_WINDOW, adjust=False).mean()
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    rsi_min = rsi.rolling(STOCH_RSI_WINDOW, min_periods=STOCH_RSI_WINDOW).min()
+    rsi_max = rsi.rolling(STOCH_RSI_WINDOW, min_periods=STOCH_RSI_WINDOW).max()
+    raw = (rsi - rsi_min) / (rsi_max - rsi_min)
+    raw = raw.where((rsi_max - rsi_min) != 0, pd.NA)
+
+    k = raw.rolling(STOCH_RSI_SMOOTH_K, min_periods=STOCH_RSI_SMOOTH_K).mean() * 100
+    d = k.rolling(STOCH_RSI_SMOOTH_D, min_periods=STOCH_RSI_SMOOTH_D).mean()
+    return k, d
+
+
+def _classify_trend(latest: dict[str, Any]) -> str:
+    close = latest.get("close")
     ma20 = latest.get("ma20")
     ma50 = latest.get("ma50")
-    close = latest.get("close")
-    rsi = latest.get("rsi14")
-    prev_ma20 = prev.get("ma20")
-    prev_ma50 = prev.get("ma50")
-
-    if pd.isna(close) or pd.isna(rsi):
-        return None
-
-    has_ma20 = not pd.isna(ma20) and not pd.isna(prev_ma20)
-    has_ma50 = not pd.isna(ma50) and not pd.isna(prev_ma50)
-
-    if has_ma20 and has_ma50:
-        ma20_rising = ma20 >= prev_ma20
-        ma50_rising = ma50 >= prev_ma50
-        above_ma20 = close >= ma20
-        above_ma50 = close >= ma50
-        if above_ma20 and above_ma50 and ma20_rising and ma50_rising and rsi >= 50:
-            return "强"
-        if (not above_ma20) and (not above_ma50) and (not ma20_rising) and rsi < 45:
-            return "弱"
-        return "中性"
-
-    if has_ma20:
-        ma20_rising = ma20 >= prev_ma20
-        above_ma20 = close >= ma20
-        if above_ma20 and ma20_rising and rsi >= 50:
-            return "偏强"
-        if (not above_ma20) and (not ma20_rising) and rsi < 45:
-            return "偏弱"
-        return "中性"
-
-    if rsi >= 60:
-        return "偏强"
-    if rsi <= 40:
-        return "偏弱"
-    return "中性"
-
-
-def _classify_risk(latest: Any, trend: str | None, pd: Any) -> str | None:
-    """Assign a coarse risk label from the latest indicator snapshot."""
-    score = 0
-    checks = 0
-
-    ma20 = latest.get("ma20")
-    ma50 = latest.get("ma50")
-    close = latest.get("close")
     rsi14 = latest.get("rsi14")
+    macd = latest.get("macd")
+    macd_signal = latest.get("macd_signal")
+    adx14 = latest.get("adx14")
+
+    if None in (close, ma20, ma50, rsi14):
+        return "样本不足"
+
+    bullish = close > ma20 and close > ma50 and rsi14 >= 50
+    bearish = close < ma20 and close < ma50 and rsi14 < 50
+
+    macd_bull = macd is not None and macd_signal is not None and macd > macd_signal
+    macd_bear = macd is not None and macd_signal is not None and macd < macd_signal
+    strong_trend = adx14 is not None and adx14 >= 25
+
+    if bullish and macd_bull and strong_trend:
+        return "强势上升"
+    if bullish:
+        return "偏强"
+    if bearish and macd_bear and strong_trend:
+        return "强势下降"
+    if bearish:
+        return "偏弱"
+    return "震荡"
+
+
+def _classify_risk(latest: dict[str, Any]) -> str:
+    risk_score = 0
+
     atr_pct = latest.get("atr_pct")
     rvol = latest.get("rvol")
-    drawdown_52w = latest.get("drawdown_from_52w_high")
-    max_drawdown_20d = latest.get("max_drawdown_20d")
+    drawdown = latest.get("drawdown_from_52w_high")
+    max_dd_20 = latest.get("max_drawdown_20d")
+    bb_width = latest.get("bb_width")
+    stochrsi_k = latest.get("stochrsi_k")
 
-    if not pd.isna(close) and not pd.isna(ma20):
-        checks += 1
-        if close < ma20:
-            score += 1
-    if not pd.isna(close) and not pd.isna(ma50):
-        checks += 1
-        if close < ma50:
-            score += 2
-    if not pd.isna(rsi14):
-        checks += 1
-        if rsi14 > 75 or rsi14 < 25:
-            score += 1
-    if not pd.isna(atr_pct):
-        checks += 1
-        if atr_pct >= 0.06:
-            score += 1
-    if not pd.isna(rvol):
-        checks += 1
-        if rvol >= 2.0:
-            score += 1
-    if not pd.isna(drawdown_52w):
-        checks += 1
-        if drawdown_52w <= -0.2:
-            score += 1
-    if not pd.isna(max_drawdown_20d):
-        checks += 1
-        if max_drawdown_20d <= -0.1:
-            score += 1
-    if trend in {"弱", "偏弱"}:
-        checks += 1
-        score += 1
+    if atr_pct is not None and atr_pct >= 6:
+        risk_score += 2
+    elif atr_pct is not None and atr_pct >= 4:
+        risk_score += 1
 
-    if checks == 0:
-        return None
-    if score >= 5:
-        return "警戒"
-    if score >= 2:
-        return "注意"
+    if rvol is not None and rvol >= 2.0:
+        risk_score += 1
+
+    if drawdown is not None and drawdown <= -30:
+        risk_score += 2
+    elif drawdown is not None and drawdown <= -15:
+        risk_score += 1
+
+    if max_dd_20 is not None and max_dd_20 <= -12:
+        risk_score += 2
+    elif max_dd_20 is not None and max_dd_20 <= -7:
+        risk_score += 1
+
+    if bb_width is not None and bb_width >= 12:
+        risk_score += 1
+
+    if stochrsi_k is not None and (stochrsi_k >= 90 or stochrsi_k <= 10):
+        risk_score += 1
+
+    if risk_score >= 5:
+        return "高波动"
+    if risk_score >= 3:
+        return "中等偏高"
     return "正常"
 
 
-def _analyze_price_frame(ticker: str, price_df: Any) -> dict[str, object]:
-    """Compute the quote snapshot from a normalized OHLCV price DataFrame."""
+def _analyze_price_frame(ticker: str, frame: Any) -> dict[str, Any]:
     pd, vbt = _load_analysis_dependencies()
-    required_columns = {"Open", "High", "Low", "Close", "Volume"}
-    if not required_columns.issubset(price_df.columns):
-        missing = ", ".join(sorted(required_columns - set(price_df.columns)))
-        raise ValueError(f"Price data is missing required columns: {missing}")
 
-    if price_df.empty:
-        raise ValueError(f"No price data available for {ticker}")
+    if len(frame) < 2:
+        raise ValueError(f"{ticker} 历史数据不足，至少需要 2 根日线")
 
-    close = price_df["Close"].astype(float)
-    high = price_df["High"].astype(float)
-    low = price_df["Low"].astype(float)
-    volume = price_df["Volume"].astype(float)
-    history_days = len(price_df)
+    close = frame["Close"].astype(float)
+    high = frame["High"].astype(float)
+    low = frame["Low"].astype(float)
+    volume = frame["Volume"].astype(float)
 
     ma20 = vbt.MA.run(close, MA_SHORT).ma
     ma50 = vbt.MA.run(close, MA_LONG).ma
     rsi14 = vbt.RSI.run(close, window=RSI_WINDOW).rsi
     atr14 = vbt.ATR.run(high, low, close, window=ATR_WINDOW).atr
+
+    macd, macd_signal, macd_hist = _compute_macd(close)
+    bb_upper, bb_middle, bb_lower, bb_width, bb_percent_b = _compute_bollinger(close, pd)
+    adx14 = _compute_adx(high, low, close, ADX_WINDOW, pd)
+    obv = _compute_obv(close, volume, pd)
+    stochrsi_k, stochrsi_d = _compute_stoch_rsi(close, pd)
+
     day_change_pct = close.pct_change()
+    avg_volume_20d = volume.rolling(VOLUME_WINDOW, min_periods=1).mean()
+    rvol = volume / avg_volume_20d
+
     high_52w = high.rolling(HIGH_52W_WINDOW, min_periods=1).max()
     drawdown_from_52w_high = close / high_52w - 1
     max_drawdown_20d = _rolling_max_drawdown(close, DRAWDOWN_WINDOW)
-    volume_available = volume.fillna(0).gt(0).any()
-
-    if volume_available:
-        avg_volume_20d = volume.rolling(VOLUME_WINDOW, min_periods=1).mean()
-        rvol = volume / avg_volume_20d
-    else:
-        avg_volume_20d = pd.Series(index=close.index, dtype=float)
-        rvol = pd.Series(index=close.index, dtype=float)
 
     metrics = pd.DataFrame(
         {
@@ -476,58 +355,89 @@ def _analyze_price_frame(ticker: str, price_df: Any) -> dict[str, object]:
             "rvol": rvol,
             "drawdown_from_52w_high": drawdown_from_52w_high,
             "max_drawdown_20d": max_drawdown_20d,
+            "macd": macd,
+            "macd_signal": macd_signal,
+            "macd_hist": macd_hist,
+            "bb_upper": bb_upper,
+            "bb_middle": bb_middle,
+            "bb_lower": bb_lower,
+            "bb_width": bb_width,
+            "bb_percent_b": bb_percent_b,
+            "adx14": adx14,
+            "obv": obv,
+            "stochrsi_k": stochrsi_k,
+            "stochrsi_d": stochrsi_d,
         }
     )
 
     latest = metrics.iloc[-1]
-    prev = metrics.iloc[-2] if len(metrics) >= 2 else metrics.iloc[-1]
-    latest_date = price_df.index[-1]
+    history_days = len(frame)
+
     history_warning: str | None = None
-
     if history_days < VOLUME_WINDOW:
-        history_warning = "历史短于 20 个交易日，部分技术指标暂不可用。"
+        history_warning = f"历史数据仅 {history_days} 根，部分技术指标暂不可用"
     elif history_days < MA_LONG:
-        history_warning = "历史短于 50 个交易日，MA50 与部分趋势/风险判断暂不可用。"
+        history_warning = f"历史数据仅 {history_days} 根，MA{MA_LONG} 及部分趋势/风险判断参考性有限"
     elif history_days < HIGH_52W_WINDOW:
-        history_warning = "历史短于 252 个交易日，52 周最高价回撤改用样本期最高价计算。"
+        history_warning = f"历史数据仅 {history_days} 根，52 周高点回撤将基于当前样本期计算"
 
-    ma20_value = None if history_days < MA_SHORT or pd.isna(latest["ma20"]) else round(float(latest["ma20"]), 2)
-    ma50_value = None if history_days < MA_LONG or pd.isna(latest["ma50"]) else round(float(latest["ma50"]), 2)
-    dev_ma20_value = None if ma20_value is None or pd.isna(latest["dev_ma20"]) else _pct(float(latest["dev_ma20"]))
-    dev_ma50_value = None if ma50_value is None or pd.isna(latest["dev_ma50"]) else _pct(float(latest["dev_ma50"]))
-    rsi14_value = None if history_days < RSI_WINDOW or pd.isna(latest["rsi14"]) else round(float(latest["rsi14"]), 2)
-    atr_pct_value = None if history_days < ATR_WINDOW or pd.isna(latest["atr_pct"]) else _pct(float(latest["atr_pct"]))
-    avg_volume_20d_value = None
-    rvol_value = None
-    if history_days >= VOLUME_WINDOW and pd.notna(latest["avg_volume_20d"]):
-        avg_volume_20d_value = round(float(latest["avg_volume_20d"]))
-    if history_days >= VOLUME_WINDOW and pd.notna(latest["rvol"]):
-        rvol_value = round(float(latest["rvol"]), 2)
-    drawdown_52w_value = None if pd.isna(latest["drawdown_from_52w_high"]) else _pct(float(latest["drawdown_from_52w_high"]))
-    max_drawdown_20d_value = None if history_days < DRAWDOWN_WINDOW or pd.isna(latest["max_drawdown_20d"]) else _pct(float(latest["max_drawdown_20d"]))
+    ma20_value = _resolve_metric(latest["ma20"], pd=pd, history_days=history_days, min_history=MA_SHORT, transform=lambda v: round(v, 2))
+    ma50_value = _resolve_metric(latest["ma50"], pd=pd, history_days=history_days, min_history=MA_LONG, transform=lambda v: round(v, 2))
+    dev_ma20_value = _resolve_metric(latest["dev_ma20"], pd=pd, history_days=history_days, min_history=MA_SHORT, transform=_pct)
+    dev_ma50_value = _resolve_metric(latest["dev_ma50"], pd=pd, history_days=history_days, min_history=MA_LONG, transform=_pct)
+    rsi14_value = _resolve_metric(latest["rsi14"], pd=pd, history_days=history_days, min_history=RSI_WINDOW, transform=lambda v: round(v, 2))
+    atr_pct_value = _resolve_metric(latest["atr_pct"], pd=pd, history_days=history_days, min_history=ATR_WINDOW, transform=_pct)
+    avg_volume_20d_value = _resolve_metric(
+        latest["avg_volume_20d"],
+        pd=pd,
+        history_days=history_days,
+        min_history=VOLUME_WINDOW,
+        transform=lambda v: round(v),
+    )
+    rvol_value = _resolve_metric(latest["rvol"], pd=pd, history_days=history_days, min_history=VOLUME_WINDOW, transform=lambda v: round(v, 2))
+    drawdown_52w_value = _resolve_metric(latest["drawdown_from_52w_high"], pd=pd, history_days=history_days, transform=_pct)
+    max_drawdown_20d_value = _resolve_metric(
+        latest["max_drawdown_20d"],
+        pd=pd,
+        history_days=history_days,
+        min_history=DRAWDOWN_WINDOW,
+        transform=_pct,
+    )
+    macd_value = _resolve_metric(latest["macd"], pd=pd, history_days=history_days, transform=lambda v: round(v, 4))
+    macd_signal_value = _resolve_metric(latest["macd_signal"], pd=pd, history_days=history_days, transform=lambda v: round(v, 4))
+    macd_hist_value = _resolve_metric(latest["macd_hist"], pd=pd, history_days=history_days, transform=lambda v: round(v, 4))
+    bb_upper_value = _resolve_metric(latest["bb_upper"], pd=pd, history_days=history_days, min_history=BB_WINDOW, transform=lambda v: round(v, 2))
+    bb_middle_value = _resolve_metric(latest["bb_middle"], pd=pd, history_days=history_days, min_history=BB_WINDOW, transform=lambda v: round(v, 2))
+    bb_lower_value = _resolve_metric(latest["bb_lower"], pd=pd, history_days=history_days, min_history=BB_WINDOW, transform=lambda v: round(v, 2))
+    bb_width_value = _resolve_metric(latest["bb_width"], pd=pd, history_days=history_days, min_history=BB_WINDOW, transform=_pct)
+    bb_percent_b_value = _resolve_metric(
+        latest["bb_percent_b"],
+        pd=pd,
+        history_days=history_days,
+        min_history=BB_WINDOW,
+        transform=lambda v: round(v, 4),
+    )
+    adx14_value = _resolve_metric(latest["adx14"], pd=pd, history_days=history_days, min_history=ADX_WINDOW, transform=lambda v: round(v, 2))
+    obv_value = _resolve_metric(latest["obv"], pd=pd, history_days=history_days, transform=lambda v: round(v))
+    stochrsi_k_value = _resolve_metric(
+        latest["stochrsi_k"],
+        pd=pd,
+        history_days=history_days,
+        min_history=RSI_WINDOW + STOCH_RSI_WINDOW + STOCH_RSI_SMOOTH_K - 1,
+        transform=lambda v: round(v, 2),
+    )
+    stochrsi_d_value = _resolve_metric(
+        latest["stochrsi_d"],
+        pd=pd,
+        history_days=history_days,
+        min_history=RSI_WINDOW + STOCH_RSI_WINDOW + STOCH_RSI_SMOOTH_K + STOCH_RSI_SMOOTH_D - 2,
+        transform=lambda v: round(v, 2),
+    )
 
-    latest_for_classification = {
-        "close": latest["close"],
-        "ma20": latest["ma20"] if ma20_value is not None else pd.NA,
-        "ma50": latest["ma50"] if ma50_value is not None else pd.NA,
-        "rsi14": latest["rsi14"] if rsi14_value is not None else pd.NA,
-        "atr_pct": latest["atr_pct"] if atr_pct_value is not None else pd.NA,
-        "rvol": latest["rvol"] if rvol_value is not None else pd.NA,
-        "drawdown_from_52w_high": latest["drawdown_from_52w_high"] if drawdown_52w_value is not None else pd.NA,
-        "max_drawdown_20d": latest["max_drawdown_20d"] if max_drawdown_20d_value is not None else pd.NA,
-    }
-    prev_for_classification = {
-        "ma20": prev["ma20"] if len(metrics) >= 2 and history_days >= MA_SHORT else pd.NA,
-        "ma50": prev["ma50"] if len(metrics) >= 2 and history_days >= MA_LONG else pd.NA,
-    }
-    trend = _classify_trend(latest_for_classification, prev_for_classification, pd)
-    risk = _classify_risk(latest_for_classification, trend, pd)
-
-    return {
-        "ticker": ticker,
-        "date": latest_date.strftime("%Y-%m-%d"),
+    result = {
+        "ticker": ticker.upper(),
+        "date": frame.index[-1].date().isoformat(),
         "history_days": history_days,
-        "history_warning": history_warning,
         "close": round(float(latest["close"]), 2),
         "day_change_pct": None if pd.isna(latest["day_change_pct"]) else _pct(float(latest["day_change_pct"])),
         "ma20": ma20_value,
@@ -539,272 +449,90 @@ def _analyze_price_frame(ticker: str, price_df: Any) -> dict[str, object]:
         "avg_volume_20d": avg_volume_20d_value,
         "rvol": rvol_value,
         "drawdown_from_52w_high": drawdown_52w_value,
-        "drawdown_label": "距 52 周最高价回撤" if history_days >= HIGH_52W_WINDOW else "距样本期最高价回撤",
+        "drawdown_label": "距 52 周高点回撤" if history_days >= HIGH_52W_WINDOW else "距样本期高点回撤",
         "max_drawdown_20d": max_drawdown_20d_value,
-        "trend": trend,
-        "risk": risk,
+        "macd": macd_value,
+        "macd_signal": macd_signal_value,
+        "macd_hist": macd_hist_value,
+        "bb_upper": bb_upper_value,
+        "bb_middle": bb_middle_value,
+        "bb_lower": bb_lower_value,
+        "bb_width": bb_width_value,
+        "bb_percent_b": bb_percent_b_value,
+        "adx14": adx14_value,
+        "obv": obv_value,
+        "stochrsi_k": stochrsi_k_value,
+        "stochrsi_d": stochrsi_d_value,
+        "history_warning": history_warning,
     }
 
-
-def _marketaux_request(params: dict[str, object]) -> list[dict[str, Any]]:
-    """Execute a Marketaux news request and normalize the response."""
-    token = _require_env("MARKETAUX_API_TOKEN")
-    response = requests.get(
-        MARKETAUX_NEWS_URL,
-        params={**params, "api_token": token},
-        timeout=REQUEST_TIMEOUT,
-    )
-
-    if response.status_code != 200:
-        detail = ""
-        with contextlib.suppress(ValueError):
-            payload = response.json()
-            detail = payload.get("error") or payload.get("message") or ""
-        suffix = f": {detail}" if detail else ""
-        raise RuntimeError(
-            f"Marketaux request failed with status {response.status_code}{suffix}"
-        )
-
-    payload = response.json()
-    raw_items = payload.get("data") or []
-    normalized: list[dict[str, Any]] = []
-    for item in raw_items:
-        normalized.append(
-            {
-                "title": (item.get("title") or "").strip(),
-                "summary": (item.get("description") or item.get("snippet") or "").strip(),
-                "source": (item.get("source") or item.get("domain") or "未知来源").strip(),
-                "published_at": item.get("published_at") or "",
-                "url": item.get("url") or "",
-                "entities": item.get("entities") or [],
-            }
-        )
-    return normalized
+    result["trend"] = _classify_trend(result)
+    result["risk"] = _classify_risk(result)
+    return result
 
 
-def _fetch_marketaux_news(raw_limit: int = DEFAULT_ALERT_RAW_LIMIT, hours: int = DEFAULT_ALERT_HOURS) -> list[dict[str, Any]]:
-    """Fetch recent broad finance news from Marketaux."""
-    published_after = (datetime.now(UTC) - timedelta(hours=hours)).replace(microsecond=0)
-    return _marketaux_request(
-        {
-            "language": "en",
-            "limit": raw_limit,
-            "published_after": published_after.strftime("%Y-%m-%dT%H:%M:%S"),
-            "group_similar": "true",
-        }
-    )
-
-
-def _fetch_ticker_news(
-    ticker: str,
-    limit: int = DEFAULT_QUOTE_NEWS_LIMIT,
-    hours: int = DEFAULT_QUOTE_NEWS_HOURS,
-) -> list[dict[str, Any]]:
-    """Fetch recent ticker-specific news from Marketaux."""
-    published_after = (datetime.now(UTC) - timedelta(hours=hours)).replace(microsecond=0)
-    news_items = _marketaux_request(
-        {
-            "language": "en",
-            "limit": max(limit * 3, 10),
-            "published_after": published_after.strftime("%Y-%m-%dT%H:%M:%S"),
-            "group_similar": "true",
-            "symbols": ticker.upper(),
-            "filter_entities": "true",
-        }
-    )
-    matched: list[dict[str, Any]] = []
-    for item in news_items:
-        haystack = f"{item.get('title', '')} {item.get('summary', '')}".lower()
-        if _matches_ticker_news(ticker, haystack):
-            matched.append(item)
-    return matched[:limit]
-
-
-def _split_market_news(news_items: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """Keep only high-relevance market news items."""
-    matched: list[dict[str, Any]] = []
-
-    for item in news_items:
-        haystack = f"{item.get('title', '')} {item.get('summary', '')}".lower()
-        if any(_contains_keyword(haystack, keyword) for keyword in MARKET_NEWS_KEYWORDS):
-            matched.append(item)
-
-    return {"matched": matched}
-
-
-def _summarize_market_news(news_items: list[dict[str, Any]]) -> str | None:
-    """Generate a simple rule-based market tone summary from matched market news only."""
-    if not news_items:
-        return None
-
-    positive_score = 0
-    negative_score = 0
-    for item in news_items:
-        haystack = f"{item.get('title', '')} {item.get('summary', '')}".lower()
-        positive_score += sum(_contains_keyword(haystack, term) for term in POSITIVE_SENTIMENT_TERMS)
-        negative_score += sum(_contains_keyword(haystack, term) for term in NEGATIVE_SENTIMENT_TERMS)
-
-    if negative_score >= positive_score + 2:
-        return "新闻流偏谨慎，风险偏好承压，短线更适合控制仓位并关注波动。"
-    if positive_score >= negative_score + 2:
-        return "新闻流偏积极，风险偏好改善，科技与成长方向更容易获得资金关注。"
-    return "新闻流多空交织，市场更像事件驱动震荡，交易上宜保持选择性。"
-
-
-def _build_market_news_overview(
-    display_limit: int = DEFAULT_ALERT_DISPLAY_LIMIT,
-    hours: int = DEFAULT_ALERT_HOURS,
-    raw_limit: int = DEFAULT_ALERT_RAW_LIMIT,
-) -> dict[str, object]:
-    """Build the alert payload from Marketaux news only."""
-    split = _split_market_news(_fetch_marketaux_news(raw_limit=raw_limit, hours=hours))
-    matched = split["matched"][:display_limit]
-    return {
-        "matched_news_items": matched,
-        "conclusion": _summarize_market_news(matched),
-        "no_match_message": (
-            f"最近 {hours} 小时未找到高相关度的市场主线新闻，可尝试扩大时间窗口或放宽相关性条件。"
-            if not matched
-            else None
-        ),
-    }
-
-
-def _print_news_section(title: str, news_items: list[dict[str, Any]], empty_message: str) -> None:
-    """Render a list of news items with compact metadata."""
-    if title:
-        console.print(title)
-    if not news_items:
-        console.print(empty_message)
-        return
-    for item in news_items:
-        source = item.get("source") or "未知来源"
-        title_text = item.get("title") or "无标题"
-        summary = item.get("summary") or "暂无摘要。"
-        published_at = _format_news_timestamp(str(item.get("published_at") or ""))
-        url = item.get("url") or ""
-        console.print(f"- [{source}] {title_text}")
-        console.print(f"  {summary}")
-        if published_at:
-            console.print(f"  发布时间: {published_at}")
-        if url:
-            console.print(f"  链接: {url}")
-
-
-def _print_market_news_overview(overview: dict[str, object], hours: int = DEFAULT_ALERT_HOURS) -> None:
-    """Render the market news alert output."""
-    matched_news_items = overview["matched_news_items"]
-    console.print("=== 市场新闻摘要 ===")
-    _print_news_section(
-        "",
-        matched_news_items,
-        f"最近 {hours} 小时暂无高相关度市场主题新闻",
-    )
-    if overview.get("no_match_message"):
-        console.print(str(overview["no_match_message"]))
-    conclusion = overview.get("conclusion")
-    if conclusion:
-        console.print(f"市场风向结论: {conclusion}")
-
-
-def _print_quote_news(ticker: str, news_items: list[dict[str, Any]], hours: int) -> None:
-    """Render the ticker-specific recent news section."""
-    console.print(f"=== {ticker} 相关新闻 ===")
-    if not news_items:
-        console.print(f"最近 {hours} 小时暂无高相关度的 {ticker} 相关新闻")
-        return
-    for item in news_items:
-        source = item.get("source") or "未知来源"
-        title = item.get("title") or "无标题"
-        summary = item.get("summary") or "暂无摘要。"
-        published_at = _format_news_timestamp(str(item.get("published_at") or ""))
-        url = item.get("url") or ""
-        console.print(f"- [{source}] {title}")
-        console.print(f"  {summary}")
-        if published_at:
-            console.print(f"  发布时间: {published_at}")
-        if url:
-            console.print(f"  链接: {url}")
-
-
-def _print_quote(item: dict[str, object]) -> None:
-    """Render the quote snapshot."""
-    console.print(f"[{item['ticker']}] {item['date']}")
-    console.print(f"收盘价: {_format_metric(item['close'])}")
-    console.print(f"当日涨跌幅: {_format_metric(item['day_change_pct'], suffix='%')}")
+# ---------- Output ----------
+def _print_quote(item: dict[str, Any]) -> None:
+    console.print(f"\n[bold cyan]{item['ticker']}[/bold cyan]  ({item['date']})")
+    console.print(f"收盘价: {_format_metric(item.get('close'))}")
+    console.print(f"当日涨跌幅: {_format_metric(item.get('day_change_pct'), suffix='%')}")
     console.print(f"MA20: {_format_metric(item.get('ma20'))}")
     console.print(f"MA50: {_format_metric(item.get('ma50'))}")
-    console.print(f"距 MA20 偏离率: {_format_metric(item.get('dev_ma20'), suffix='%')}")
-    console.print(f"距 MA50 偏离率: {_format_metric(item.get('dev_ma50'), suffix='%')}")
+    console.print(f"距 MA20 偏离: {_format_metric(item.get('dev_ma20'), suffix='%')}")
+    console.print(f"距 MA50 偏离: {_format_metric(item.get('dev_ma50'), suffix='%')}")
     console.print(f"RSI14: {_format_metric(item.get('rsi14'))}")
     console.print(f"ATR%: {_format_metric(item.get('atr_pct'), suffix='%')}")
-    avg_volume = (
-        f"{int(item['avg_volume_20d']):,}" if item.get("avg_volume_20d") is not None else "暂无"
-    )
-    console.print(f"20 日平均成交量: {avg_volume}")
-    console.print(f"相对成交量 RVOL: {_format_metric(item.get('rvol'))}")
-    console.print(
-        f"{item.get('drawdown_label', '距 52 周最高价回撤')}: "
-        f"{_format_metric(item.get('drawdown_from_52w_high'), suffix='%')}"
-    )
+    console.print(f"20 日平均成交量: {_format_metric(item.get('avg_volume_20d'))}")
+    console.print(f"RVOL: {_format_metric(item.get('rvol'))}")
+    console.print(f"{item.get('drawdown_label', '距 52 周高点回撤')}: {_format_metric(item.get('drawdown_from_52w_high'), suffix='%')}")
     console.print(f"20 日最大回撤: {_format_metric(item.get('max_drawdown_20d'), suffix='%')}")
-    console.print(f"趋势状态: {item.get('trend') or '暂无'}")
-    console.print(f"风险标签: {item.get('risk') or '暂无'}")
+
+    console.print(f"MACD: {_format_metric(item.get('macd'), digits=4)}")
+    console.print(f"MACD Signal: {_format_metric(item.get('macd_signal'), digits=4)}")
+    console.print(f"MACD Hist: {_format_metric(item.get('macd_hist'), digits=4)}")
+
+    console.print(f"Boll 上轨: {_format_metric(item.get('bb_upper'))}")
+    console.print(f"Boll 中轨: {_format_metric(item.get('bb_middle'))}")
+    console.print(f"Boll 下轨: {_format_metric(item.get('bb_lower'))}")
+    console.print(f"Boll 带宽: {_format_metric(item.get('bb_width'), suffix='%')}")
+    console.print(f"%B: {_format_metric(item.get('bb_percent_b'), digits=4)}")
+
+    console.print(f"ADX14: {_format_metric(item.get('adx14'))}")
+
+    obv_value = f"{int(item['obv']):,}" if item.get("obv") is not None else "暂无"
+    console.print(f"OBV: {obv_value}")
+
+    console.print(f"Stoch RSI %K: {_format_metric(item.get('stochrsi_k'))}")
+    console.print(f"Stoch RSI %D: {_format_metric(item.get('stochrsi_d'))}")
+
+    console.print(f"趋势状态: {item.get('trend', '暂无')}")
+    console.print(f"风险标签: {item.get('risk', '暂无')}")
+
     if item.get("history_warning"):
-        console.print(f"提示: {item['history_warning']}")
+        console.print(f"[yellow]提示: {item['history_warning']}[/yellow]")
 
 
-@app.command("alert")
-def stock_alert(
-    limit: int = typer.Option(DEFAULT_ALERT_DISPLAY_LIMIT, min=1, help="展示新闻条数"),
-    hours: int = typer.Option(DEFAULT_ALERT_HOURS, min=1, help="回看新闻小时数"),
-) -> None:
-    """显示近期市场新闻摘要。"""
-    try:
-        with console.status("[bold green]正在获取市场新闻..."):
-            overview = _build_market_news_overview(
-                display_limit=limit,
-                hours=hours,
-            )
-    except Exception as exc:
-        console.print(f"[red]stock alert 执行失败: {exc}[/red]")
-        raise typer.Exit(code=1) from exc
-
-    _print_market_news_overview(overview, hours=hours)
-
-
+# ---------- CLI ----------
 @app.command("quote")
 def stock_quote(
     ticker: str = typer.Argument(..., help="股票代码"),
-    news_limit: int = typer.Option(DEFAULT_QUOTE_NEWS_LIMIT, min=1, help="ticker 新闻展示条数"),
-    news_hours: int = typer.Option(DEFAULT_QUOTE_NEWS_HOURS, min=1, help="ticker 新闻回看小时数"),
     lookback_days: int = typer.Option(QUOTE_LOOKBACK_DAYS, min=30, help="技术分析价格回看天数"),
 ) -> None:
-    """查询单只股票的近期新闻和技术状态。"""
+    """查询单只股票的技术状态。"""
     normalized_ticker = ticker.upper()
-    news_items: list[dict[str, Any]] = []
-    news_warning: str | None = None
 
     try:
-        news_items = _fetch_ticker_news(
-            normalized_ticker,
-            limit=news_limit,
-            hours=news_hours,
-        )
-    except Exception as exc:
-        news_warning = f"相关新闻获取失败：{exc}"
-
-    try:
-        with console.status(f"[bold green]正在获取 {ticker.upper()} 行情并计算技术指标..."):
+        with console.status(f"[bold green]正在从 FMP 获取 {normalized_ticker} 行情并计算技术指标..."):
             resolved_start = _quote_start_from_lookback(lookback_days)
-            price_df = _fetch_polygon_daily_bars(normalized_ticker, resolved_start)
+            price_df = _fetch_fmp_daily_bars(normalized_ticker, resolved_start)
+            price_df = price_df.tail(lookback_days)
             item = _analyze_price_frame(normalized_ticker, price_df)
     except Exception as exc:
         console.print(f"[red]stock quote 执行失败: {exc}[/red]")
         raise typer.Exit(code=1) from exc
 
-    _print_quote_news(item["ticker"], news_items, news_hours)
-    if news_warning:
-        console.print(f"提示: {news_warning}")
-    console.print()
     _print_quote(item)
+
+
+if __name__ == "__main__":
+    app()
