@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -18,6 +18,7 @@ app = typer.Typer(
     no_args_is_help=False,
 )
 console = Console()
+LAUNCHAGENT_LABEL = "ai.openclaw.gateway"
 
 
 def _check_openclaw_installed() -> bool:
@@ -47,79 +48,140 @@ def _get_current_version() -> str:
         return "unknown"
 
 
+def _get_uid() -> str:
+    """Get current user id for launchctl gui domain."""
+    result = subprocess.run(
+        ["id", "-u"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _gateway_status_output(timeout: int = 5) -> str:
+    """Return raw gateway status output."""
+    result = subprocess.run(
+        ["openclaw", "gateway", "status"],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    return (result.stdout or "") + (result.stderr or "")
+
+
+def _service_is_loaded(status_text: str) -> bool:
+    """Check whether LaunchAgent is actually loaded."""
+    return "Service: LaunchAgent (loaded)" in status_text
+
+
+def _rpc_probe_is_ok(status_text: str) -> bool:
+    """Check whether gateway probe succeeds."""
+    return "RPC probe: ok" in status_text
+
+
+def _gateway_is_listening(status_text: str) -> bool:
+    """Check whether gateway is listening on loopback."""
+    return bool(re.search(r"Listening:\s+127\.0\.0\.1:\d+", status_text))
+
+
+def _gateway_ready_via_service(status_text: str) -> bool:
+    """Require both a loaded LaunchAgent and a healthy gateway probe."""
+    return (
+        _service_is_loaded(status_text)
+        and _rpc_probe_is_ok(status_text)
+        and _gateway_is_listening(status_text)
+    )
+
+
+def _launchctl_print_loaded(uid: str) -> bool:
+    """Check whether launchd knows about the service label."""
+    result = subprocess.run(
+        ["launchctl", "print", f"gui/{uid}/{LAUNCHAGENT_LABEL}"],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
 def _reinstall_launchagent() -> tuple[bool, str]:
     """Reinstall LaunchAgent to fix 'Gateway service not loaded' issue.
-    
+
     Returns:
         Tuple of (success: bool, message: str)
     """
     try:
-        # Step 1: Check if plist exists
         plist_path = Path.home() / "Library/LaunchAgents/ai.openclaw.gateway.plist"
         if not plist_path.exists():
             return False, f"LaunchAgent plist not found at {plist_path}"
-        
-        # Step 2: Unload if loaded (ignore errors)
-        console.print("[yellow]→ Unloading existing LaunchAgent...[/yellow]")
+
+        uid = _get_uid()
+        gui_domain = f"gui/{uid}"
+        service_target = f"{gui_domain}/{LAUNCHAGENT_LABEL}"
+
+        console.print("[yellow]→ Booting out existing LaunchAgent (ignore errors if absent)...[/yellow]")
         subprocess.run(
-            ["launchctl", "unload", str(plist_path)],
+            ["launchctl", "bootout", gui_domain, str(plist_path)],
             capture_output=True,
+            text=True,
         )
         time.sleep(1)
-        
-        # Step 3: Reload LaunchAgent
-        console.print("[yellow]→ Reloading LaunchAgent...[/yellow]")
-        result = subprocess.run(
-            ["launchctl", "load", str(plist_path)],
+
+        console.print("[yellow]→ Bootstrapping LaunchAgent...[/yellow]")
+        bootstrap = subprocess.run(
+            ["launchctl", "bootstrap", gui_domain, str(plist_path)],
             capture_output=True,
             text=True,
         )
-        if result.returncode != 0:
-            # Try bootstrap as fallback
-            result = subprocess.run(
-                ["launchctl", "bootstrap", f"gui/{subprocess.run(['id', '-u'], capture_output=True, text=True).stdout.strip()}", str(plist_path)],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                return False, f"Failed to load LaunchAgent: {result.stderr}"
-        
+        if bootstrap.returncode != 0 and "already bootstrapped" not in (bootstrap.stderr or "").lower():
+            return False, f"Failed to bootstrap LaunchAgent: {(bootstrap.stderr or bootstrap.stdout).strip()}"
+
+        console.print("[yellow]→ Kickstarting LaunchAgent...[/yellow]")
+        kickstart = subprocess.run(
+            ["launchctl", "kickstart", "-k", service_target],
+            capture_output=True,
+            text=True,
+        )
+        if kickstart.returncode != 0:
+            return False, f"Failed to kickstart LaunchAgent: {(kickstart.stderr or kickstart.stdout).strip()}"
+
         time.sleep(2)
-        
-        # Step 4: Verify gateway is running
-        result = subprocess.run(
-            ["openclaw", "gateway", "status"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0 and "running" in result.stdout.lower():
-            return True, "LaunchAgent reinstalled and gateway is running"
-        
-        return True, "LaunchAgent reinstalled (gateway starting)"
-        
+
+        if not _launchctl_print_loaded(uid):
+            return False, "LaunchAgent did not appear in launchctl after bootstrap/kickstart"
+
+        status_text = _gateway_status_output(timeout=10)
+        if _gateway_ready_via_service(status_text):
+            return True, "LaunchAgent reinstalled and gateway service is healthy"
+
+        details = []
+        if not _service_is_loaded(status_text):
+            details.append("service not loaded")
+        if not _rpc_probe_is_ok(status_text):
+            details.append("RPC probe not ok")
+        if not _gateway_is_listening(status_text):
+            details.append("gateway not listening")
+        suffix = ", ".join(details) if details else "post-install verification failed"
+        return False, f"LaunchAgent installed but verification failed: {suffix}"
+
     except Exception as e:
         return False, f"Error reinstalling LaunchAgent: {e}"
 
 
 def _wait_for_gateway(timeout: int = 30) -> bool:
-    """Wait for gateway to become ready.
-    
+    """Wait for gateway service to become ready.
+
     Args:
         timeout: Maximum seconds to wait
-        
+
     Returns:
-        True if gateway is ready, False otherwise
+        True if gateway service is ready, False otherwise
     """
-    console.print(f"[yellow]→ Waiting for gateway to start (max {timeout}s)...[/yellow]")
-    for i in range(timeout):
+    console.print(f"[yellow]→ Waiting for gateway service to start (max {timeout}s)...[/yellow]")
+    for _ in range(timeout):
         try:
-            result = subprocess.run(
-                ["openclaw", "gateway", "status"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode == 0 and "running" in result.stdout.lower():
+            status_text = _gateway_status_output(timeout=5)
+            if _gateway_ready_via_service(status_text):
                 return True
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
@@ -143,19 +205,18 @@ def update(
     ),
 ):
     """Update OpenClaw to the latest version.
-    
+
     This is the ONLY authorized way to update OpenClaw.
     DO NOT run 'openclaw update' directly or use other package managers.
-    
+
     This command will:
     1. Update OpenClaw to the latest version
     2. Reinstall LaunchAgent to prevent "Gateway service not loaded" errors
-    3. Wait for gateway to become ready
+    3. Wait for gateway service to become ready
     """
     if ctx.invoked_subcommand is not None:
         return
 
-    # Check if openclaw is installed
     if not _check_openclaw_installed():
         console.print(
             Panel(
@@ -168,7 +229,7 @@ def update(
         raise typer.Exit(code=1)
 
     current_version = _get_current_version()
-    
+
     if status_only:
         console.print(
             Panel(
@@ -180,43 +241,40 @@ def update(
         )
         return
 
-    # Show current version and confirm
     console.print(
         Panel(
             f"[bold cyan]Current version:[/bold cyan] {current_version}\n"
             "This will update OpenClaw to the latest version.\n"
-            "The gateway service will be automatically restarted.",
+            "The gateway service will be automatically restarted and verified.",
             title="OpenClaw Update",
             border_style="cyan",
         )
     )
 
-    # Run openclaw update
     console.print("[yellow]→ Running 'openclaw update'...[/yellow]")
-    
+
     try:
         result = subprocess.run(
             ["openclaw", "update"],
             capture_output=False,
             text=True,
         )
-        
+
         if result.returncode != 0:
             console.print(
                 Panel(
                     "[bold red]✗ Update failed[/bold red]\n"
                     "Please check the error message above.\n"
                     "If the issue persists, try:\n"
-                    "  1. Stop gateway: openclaw gateway stop\n"
-                    "  2. Manual update: pnpm update -g openclaw\n"
-                    "  3. Start gateway: openclaw gateway start",
+                    "  1. Check status: openclaw gateway status\n"
+                    "  2. Reinstall service: openclaw gateway install\n"
+                    "  3. Verify service: openclaw gateway status",
                     title="Error",
                     border_style="red",
                 )
             )
             raise typer.Exit(code=result.returncode)
-        
-        # Update succeeded
+
         new_version = _get_current_version()
         console.print(
             Panel(
@@ -227,33 +285,31 @@ def update(
                 border_style="green",
             )
         )
-        
-        # Step 2: Reinstall LaunchAgent (unless skipped)
+
         if not skip_launchagent:
             console.print("\n[yellow]→ Reinstalling LaunchAgent to prevent service errors...[/yellow]")
             success, message = _reinstall_launchagent()
-            
+
             if success:
                 console.print(f"[green]✓ {message}[/green]")
             else:
                 console.print(
                     Panel(
                         f"[yellow]⚠ LaunchAgent reinstall issue:[/yellow] {message}\n"
-                        "Gateway may still work. If you see 'Gateway service not loaded' errors,\n"
-                        "try running: openclaw gateway install",
+                        "The update succeeded, but the service was not verified as healthy.\n"
+                        "Try: openclaw gateway install",
                         title="Warning",
                         border_style="yellow",
                     )
                 )
-        
-        # Step 3: Wait for gateway to be ready
-        console.print("\n[yellow]→ Waiting for gateway to become ready...[/yellow]")
+
+        console.print("\n[yellow]→ Waiting for gateway service to become ready...[/yellow]")
         if _wait_for_gateway(timeout=30):
             console.print(
                 Panel(
                     "[bold green]✓ OpenClaw is ready![/bold green]\n"
                     f"Version: {new_version}\n"
-                    "Gateway is running and accepting connections.",
+                    "LaunchAgent is loaded and gateway is accepting connections.",
                     title="Update Complete",
                     border_style="green",
                 )
@@ -261,14 +317,14 @@ def update(
         else:
             console.print(
                 Panel(
-                    "[yellow]⚠ Gateway may still be starting[/yellow]\n"
-                    "Please wait a moment and check with:\n"
+                    "[yellow]⚠ Gateway service verification did not complete in time[/yellow]\n"
+                    "Please check with:\n"
                     "  openclaw gateway status",
                     title="Starting",
                     border_style="yellow",
                 )
             )
-            
+
     except FileNotFoundError:
         console.print(
             Panel(
@@ -298,7 +354,7 @@ def update_status():
         raise typer.Exit(code=1)
 
     current_version = _get_current_version()
-    
+
     console.print(
         Panel(
             f"[bold cyan]Current OpenClaw version:[/bold cyan] {current_version}\n"
