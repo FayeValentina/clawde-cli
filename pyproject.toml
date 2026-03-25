@@ -9,6 +9,7 @@ dependencies = [
     "rich>=13.0.0",
     "requests>=2.31.0",
     "psutil>=5.9.0",
+    "vectorbt>=0.28.4",
     "pandas>=2.0.0",
 ]
 
