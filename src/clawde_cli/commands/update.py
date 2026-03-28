@@ -101,18 +101,19 @@ def _rpc_probe_is_ok(status_text: str) -> bool:
     return "RPC probe: ok" in status_text
 
 
+def _runtime_is_running(status_text: str) -> bool:
+    """Check whether the gateway runtime reports as running."""
+    return "Runtime: running" in status_text
+
+
 def _gateway_is_listening(status_text: str) -> bool:
-    """Check whether gateway is listening on loopback."""
-    return bool(re.search(r"Listening:\s+127\.0\.0\.1:\d+", status_text))
+    """Check whether gateway reports one or more listening addresses."""
+    return bool(re.search(r"Listening:\s+\S+", status_text))
 
 
 def _gateway_ready_via_service(status_text: str) -> bool:
-    """Require both a loaded LaunchAgent and a healthy gateway probe."""
-    return (
-        _service_is_loaded(status_text)
-        and _rpc_probe_is_ok(status_text)
-        and _gateway_is_listening(status_text)
-    )
+    """Treat the gateway as healthy using OpenClaw's documented baseline."""
+    return _runtime_is_running(status_text) and _rpc_probe_is_ok(status_text)
 
 
 def _launchctl_print_loaded(uid: str) -> bool:
@@ -126,7 +127,7 @@ def _launchctl_print_loaded(uid: str) -> bool:
 
 
 def _reinstall_launchagent() -> tuple[bool, str]:
-    """Reinstall LaunchAgent to fix 'Gateway service not loaded' issue.
+    """Repair LaunchAgent bootstrap without tearing down a healthy service.
 
     Returns:
         Tuple of (success: bool, message: str)
@@ -139,14 +140,30 @@ def _reinstall_launchagent() -> tuple[bool, str]:
         uid = _get_uid()
         gui_domain = f"gui/{uid}"
         service_target = f"{gui_domain}/{LAUNCHAGENT_LABEL}"
+        status_text = _gateway_status_output(timeout=10)
 
-        console.print("[yellow]→ Booting out existing LaunchAgent (ignore errors if absent)...[/yellow]")
+        if _gateway_ready_via_service(status_text):
+            return True, "Gateway already healthy; LaunchAgent repair not needed"
+
+        if _service_is_loaded(status_text):
+            console.print("[yellow]→ Kickstarting existing LaunchAgent...[/yellow]")
+            kickstart = subprocess.run(
+                ["launchctl", "kickstart", "-k", service_target],
+                capture_output=True,
+                text=True,
+            )
+            if kickstart.returncode == 0:
+                time.sleep(2)
+                status_text = _gateway_status_output(timeout=10)
+                if _gateway_ready_via_service(status_text):
+                    return True, "LaunchAgent restarted and gateway service is healthy"
+
+        console.print("[yellow]→ Enabling LaunchAgent...[/yellow]")
         subprocess.run(
-            ["launchctl", "bootout", gui_domain, str(plist_path)],
+            ["launchctl", "enable", service_target],
             capture_output=True,
             text=True,
         )
-        time.sleep(1)
 
         console.print("[yellow]→ Bootstrapping LaunchAgent...[/yellow]")
         bootstrap = subprocess.run(
@@ -173,17 +190,19 @@ def _reinstall_launchagent() -> tuple[bool, str]:
 
         status_text = _gateway_status_output(timeout=10)
         if _gateway_ready_via_service(status_text):
-            return True, "LaunchAgent reinstalled and gateway service is healthy"
+            return True, "LaunchAgent repaired and gateway service is healthy"
 
         details = []
         if not _service_is_loaded(status_text):
             details.append("service not loaded")
+        if not _runtime_is_running(status_text):
+            details.append("runtime not running")
         if not _rpc_probe_is_ok(status_text):
             details.append("RPC probe not ok")
         if not _gateway_is_listening(status_text):
             details.append("gateway not listening")
-        suffix = ", ".join(details) if details else "post-install verification failed"
-        return False, f"LaunchAgent installed but verification failed: {suffix}"
+        suffix = ", ".join(details) if details else "post-repair verification failed"
+        return False, f"LaunchAgent repaired but verification failed: {suffix}"
 
     except Exception as e:
         return False, f"Error reinstalling LaunchAgent: {e}"
@@ -218,9 +237,13 @@ def _build_gateway_status_summary() -> tuple[str, str]:
         return "unknown", f"Unable to query gateway status: {exc}"
 
     if _gateway_ready_via_service(status_text):
-        return "ready", "LaunchAgent loaded, RPC probe ok, and gateway is listening."
+        return "ready", "Runtime running and RPC probe ok."
 
     details = []
+    if _runtime_is_running(status_text):
+        details.append("runtime running")
+    else:
+        details.append("runtime not running")
     if _service_is_loaded(status_text):
         details.append("LaunchAgent loaded")
     else:
@@ -343,21 +366,25 @@ def update(
         )
 
         if not skip_launchagent:
-            console.print("\n[yellow]→ Reinstalling LaunchAgent to prevent service errors...[/yellow]")
-            success, message = _reinstall_launchagent()
-
-            if success:
-                console.print(f"[green]✓ {message}[/green]")
+            post_update_status = _gateway_status_output(timeout=10)
+            if _gateway_ready_via_service(post_update_status):
+                console.print("\n[green]✓ Gateway remained healthy after update.[/green]")
             else:
-                console.print(
-                    Panel(
-                        f"[yellow]⚠ LaunchAgent reinstall issue:[/yellow] {message}\n"
-                        "The update succeeded, but the service was not verified as healthy.\n"
-                        "Try: openclaw gateway install",
-                        title="Warning",
-                        border_style="yellow",
+                console.print("\n[yellow]→ Repairing LaunchAgent after update...[/yellow]")
+                success, message = _reinstall_launchagent()
+
+                if success:
+                    console.print(f"[green]✓ {message}[/green]")
+                else:
+                    console.print(
+                        Panel(
+                            f"[yellow]⚠ LaunchAgent repair issue:[/yellow] {message}\n"
+                            "The update succeeded, but the service was not verified as healthy.\n"
+                            "Try: openclaw gateway install",
+                            title="Warning",
+                            border_style="yellow",
+                        )
                     )
-                )
 
         if skip_launchagent:
             console.print(
