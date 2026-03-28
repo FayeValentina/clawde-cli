@@ -49,25 +49,24 @@ def test_update_status_subcommand_prints_version_and_gateway_status(monkeypatch)
 
 def test_update_skip_launchagent_skips_repair_and_wait(monkeypatch):
     version_calls = iter(["openclaw 1.0.0", "openclaw 1.1.0"])
-    repair_called = False
+    install_called = False
     wait_called = False
 
     monkeypatch.setattr(update_cmd, "_probe_openclaw", lambda: (True, None))
+    monkeypatch.setattr(update_cmd, "_probe_npm", lambda: (True, None))
     monkeypatch.setattr(update_cmd, "_get_current_version", lambda: next(version_calls))
     monkeypatch.setattr(
         update_cmd,
         "_build_gateway_status_summary",
         lambda: ("degraded", "runtime not running, LaunchAgent not loaded, RPC probe failed"),
     )
-    monkeypatch.setattr(
-        update_cmd,
-        "_gateway_status_output",
-        lambda timeout=10: "Runtime: unknown\nRPC probe: failed\nService: LaunchAgent (not loaded)\n",
-    )
 
-    def fake_reinstall():
-        nonlocal repair_called
-        repair_called = True
+    def fake_install_latest():
+        return True, "updated"
+
+    def fake_install_gateway():
+        nonlocal install_called
+        install_called = True
         return True, "unexpected"
 
     def fake_wait(timeout: int = 30) -> bool:
@@ -75,19 +74,14 @@ def test_update_skip_launchagent_skips_repair_and_wait(monkeypatch):
         wait_called = True
         return True
 
-    monkeypatch.setattr(update_cmd, "_reinstall_launchagent", fake_reinstall)
+    monkeypatch.setattr(update_cmd, "_install_latest_openclaw", fake_install_latest)
+    monkeypatch.setattr(update_cmd, "_install_gateway_service", fake_install_gateway)
     monkeypatch.setattr(update_cmd, "_wait_for_gateway", fake_wait)
-    monkeypatch.setattr(update_cmd, "_find_openclaw_command", lambda: "/usr/local/bin/openclaw")
-    monkeypatch.setattr(
-        update_cmd.subprocess,
-        "run",
-        lambda *args, **kwargs: SimpleNamespace(returncode=0),
-    )
 
     result = runner.invoke(app, ["update", "--skip-launchagent"])
 
     assert result.exit_code == 0
-    assert repair_called is False
+    assert install_called is False
     assert wait_called is False
     assert "skipped by request" in result.stdout
     assert "gateway verification were skipped" in result.stdout
@@ -99,82 +93,71 @@ def test_gateway_ready_matches_openclaw_documented_baseline():
     assert update_cmd._gateway_ready_via_service(status) is True
 
 
-def test_reinstall_launchagent_does_not_bootout_existing_service(monkeypatch):
-    monkeypatch.setattr(update_cmd, "_get_uid", lambda: "501")
-    monkeypatch.setattr(update_cmd, "_launchctl_print_loaded", lambda uid: True)
-
+def test_install_latest_openclaw_uses_npm(monkeypatch):
     calls = []
 
-    def fake_run(args, capture_output=True, text=True, timeout=None, check=False):
-        calls.append(args)
-        command = tuple(args[:2])
-        if command == ("launchctl", "enable"):
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if command == ("launchctl", "bootstrap"):
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if command == ("launchctl", "kickstart"):
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        raise AssertionError(f"unexpected subprocess call: {args}")
+    monkeypatch.setattr(update_cmd, "_find_npm_command", lambda: "/opt/homebrew/bin/npm")
 
-    status_calls = iter(
-        [
-            "Runtime: unknown\nRPC probe: failed\nService: LaunchAgent (not loaded)\n",
-            "Runtime: running\nRPC probe: ok\nService: LaunchAgent (loaded)\n",
-        ]
-    )
-    monkeypatch.setattr(update_cmd, "_gateway_status_output", lambda timeout=10: next(status_calls))
+    def fake_run(args, capture_output=False, text=True):
+        calls.append(args)
+        return SimpleNamespace(returncode=0)
+
     monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
 
-    success, message = update_cmd._reinstall_launchagent()
+    success, message = update_cmd._install_latest_openclaw()
 
     assert success is True
-    assert "healthy" in message
-    assert all(call[1] != "bootout" for call in calls)
+    assert "updated via npm" in message
+    assert calls == [["/opt/homebrew/bin/npm", "install", "-g", "openclaw@latest"]]
 
 
 def test_update_skips_repair_when_gateway_is_healthy_after_update(monkeypatch):
     version_calls = iter(["openclaw 1.0.0", "openclaw 1.1.0"])
-    repair_called = False
+    install_called = False
     wait_called = False
 
     monkeypatch.setattr(update_cmd, "_probe_openclaw", lambda: (True, None))
+    monkeypatch.setattr(update_cmd, "_probe_npm", lambda: (True, None))
     monkeypatch.setattr(update_cmd, "_get_current_version", lambda: next(version_calls))
     monkeypatch.setattr(
         update_cmd,
         "_build_gateway_status_summary",
         lambda: ("ready", "Runtime running and RPC probe ok."),
     )
-    monkeypatch.setattr(
-        update_cmd,
-        "_gateway_status_output",
-        lambda timeout=10: "Runtime: running\nRPC probe: ok\nService: LaunchAgent (loaded)\n",
-    )
 
-    def fake_reinstall():
-        nonlocal repair_called
-        repair_called = True
-        return True, "unexpected"
+    def fake_install_latest():
+        return True, "updated"
+
+    def fake_install_gateway():
+        nonlocal install_called
+        install_called = True
+        return True, "Gateway LaunchAgent installed"
 
     def fake_wait(timeout: int = 30) -> bool:
         nonlocal wait_called
         wait_called = True
         return True
 
-    monkeypatch.setattr(update_cmd, "_reinstall_launchagent", fake_reinstall)
+    monkeypatch.setattr(update_cmd, "_install_latest_openclaw", fake_install_latest)
+    monkeypatch.setattr(update_cmd, "_install_gateway_service", fake_install_gateway)
     monkeypatch.setattr(update_cmd, "_wait_for_gateway", fake_wait)
-    monkeypatch.setattr(update_cmd, "_find_openclaw_command", lambda: "/usr/local/bin/openclaw")
-    monkeypatch.setattr(
-        update_cmd.subprocess,
-        "run",
-        lambda *args, **kwargs: SimpleNamespace(returncode=0),
-    )
 
     result = runner.invoke(app, ["update"])
 
     assert result.exit_code == 0
-    assert repair_called is False
+    assert install_called is True
     assert wait_called is True
-    assert "Gateway remained healthy after update" in result.stdout
+    assert "Gateway LaunchAgent installed" in result.stdout
+
+
+def test_update_fails_when_npm_is_unavailable(monkeypatch):
+    monkeypatch.setattr(update_cmd, "_probe_openclaw", lambda: (True, None))
+    monkeypatch.setattr(update_cmd, "_probe_npm", lambda: (False, "npm is not installed or not in PATH."))
+
+    result = runner.invoke(app, ["update"])
+
+    assert result.exit_code == 1
+    assert "npm is unavailable" in result.stdout
 
 
 def test_probe_openclaw_reports_broken_command(monkeypatch):

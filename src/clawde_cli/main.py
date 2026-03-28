@@ -4,7 +4,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
-from clawde_cli.commands import doctor, extract, log, memory, run, search, stock, system, update, weather
+from clawde_cli.commands import doctor, extract, log, memory, run, search, stock, system, update, upgrade, weather
 
 app = typer.Typer(
     name="clawde",
@@ -23,6 +23,7 @@ app.add_typer(doctor.app, name="doctor", help="Environment diagnostics")
 app.add_typer(run.app, name="run", help="Reliable command execution")
 app.add_typer(log.app, name="log", help="Event log operations")
 app.add_typer(update.app, name="update", help="Safe OpenClaw update wrapper")
+app.add_typer(upgrade.app, name="upgrade", help="Upgrade the global Clawde CLI from the original local workspace")
 app.command(name="search", help="Search session utterances")(search.search_command)
 
 
