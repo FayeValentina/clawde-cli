@@ -9,7 +9,9 @@ from zoneinfo import ZoneInfo
 
 import requests
 import typer
+from requests.adapters import HTTPAdapter
 from rich.console import Console
+from urllib3.util.retry import Retry
 
 app = typer.Typer(help="Stock market quote analysis")
 console = Console()
@@ -35,8 +37,29 @@ CCI_WINDOW = 20
 CMF_WINDOW = 20
 MFI_WINDOW = 14
 REQUEST_TIMEOUT = 20
-POLYGON_BASE_URL = "https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
+POLYGON_AGGS_URL = "https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{from_date}/{to_date}"
+FINNHUB_QUOTE_URL = "https://finnhub.io/api/v1/quote"
+FINNHUB_CANDLE_URL = "https://finnhub.io/api/v1/stock/candle"
 NEW_YORK_TZ = ZoneInfo("America/New_York")
+
+
+def _build_session() -> requests.Session:
+    """Build a shared session with a small retry budget for transient errors."""
+    retry = Retry(
+        total=2,
+        connect=2,
+        read=2,
+        status=2,
+        backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
+
+
+SESSION = _build_session()
 
 
 def _load_analysis_dependencies() -> tuple[Any, Any]:
@@ -220,65 +243,316 @@ def _compute_mfi(high: Any, low: Any, close: Any, volume: Any, window: int, pd: 
     return mfi.where(negative_sum != 0, pd.NA)
 
 
-def _fetch_polygon_daily_bars(ticker: str, start: str) -> Any:
-    """Fetch daily OHLCV bars from Polygon and normalize them to a DataFrame."""
+def _history_period_bounds(start: str) -> tuple[int, int]:
+    """Return inclusive unix timestamp bounds for a historical data request."""
+    period1 = int(datetime.fromisoformat(start).replace(tzinfo=UTC).timestamp())
+    period2 = int((datetime.now(UTC) + timedelta(days=1)).timestamp())
+    return period1, period2
+
+
+def _response_detail(response: requests.Response, *keys: str) -> str:
+    """Extract a best-effort error detail string from a JSON response."""
+    with contextlib.suppress(ValueError):
+        payload = response.json()
+        if isinstance(payload, dict):
+            for key in keys:
+                value = payload.get(key)
+                if value:
+                    return str(value)
+    return ""
+
+
+def _normalize_daily_bars(
+    pd: Any,
+    ticker: str,
+    *,
+    source: str,
+    timestamps: Any,
+    open_values: Any,
+    high_values: Any,
+    low_values: Any,
+    close_values: Any,
+    volume_values: Any,
+) -> Any:
+    """Normalize raw OHLCV arrays into the shared price frame shape."""
+    if not timestamps:
+        raise ValueError(f"{source} returned no daily bars for {ticker.upper()}")
+
+    frame = pd.DataFrame(
+        {
+            "Open": open_values,
+            "High": high_values,
+            "Low": low_values,
+            "Close": close_values,
+            "Volume": volume_values,
+        },
+        index=pd.to_datetime(timestamps, unit="s", utc=True)
+        .tz_convert(NEW_YORK_TZ)
+        .tz_localize(None)
+        .normalize(),
+    )
+    frame = frame.dropna(subset=["Open", "High", "Low", "Close"], how="any")
+    if frame.empty:
+        raise ValueError(f"{source} returned no usable daily bars for {ticker.upper()}")
+
+    frame = frame.sort_index()
+    frame = frame[~frame.index.duplicated(keep="last")]
+    return frame
+
+
+def _quote_session_snapshot(ticker: str, quote: dict[str, Any]) -> dict[str, float | Any]:
+    """Normalize a realtime quote into session-level OHLC values."""
     pd, _ = _load_analysis_dependencies()
-    api_key = _require_env("POLYGON_API_KEY")
-    end = datetime.now(UTC).date().isoformat()
-    response = requests.get(
-        POLYGON_BASE_URL.format(ticker=ticker.upper(), start=start, end=end),
+    current = quote.get("c")
+    timestamp = quote.get("t")
+    ticker_label = ticker.upper() if ticker else "ticker"
+    if current in (None, 0) or not timestamp:
+        raise RuntimeError(f"Unable to build fallback quote snapshot for {ticker_label}")
+
+    quote_dt = datetime.fromtimestamp(float(timestamp), tz=UTC).astimezone(NEW_YORK_TZ)
+    session_date = pd.Timestamp(quote_dt.replace(hour=0, minute=0, second=0, microsecond=0).replace(tzinfo=None))
+    open_price = quote.get("o") if quote.get("o") is not None else current
+    high_candidates = [value for value in (quote.get("h"), current, open_price) if value is not None]
+    low_candidates = [value for value in (quote.get("l"), current, open_price) if value is not None]
+    return {
+        "session_date": session_date,
+        "open": float(open_price),
+        "high": float(max(high_candidates)),
+        "low": float(min(low_candidates)),
+        "close": float(current),
+    }
+
+
+def _metric_value(
+    pd: Any,
+    latest: Any,
+    column: str,
+    *,
+    digits: int = 2,
+    percent: bool = False,
+    requires: object | None = None,
+    round_to_int: bool = False,
+) -> float | int | None:
+    """Return a rounded metric value when enough history and source data exist."""
+    if requires is None:
+        requires = []
+    required_values = requires if isinstance(requires, (list, tuple, set)) else [requires]
+    if any(value is None for value in required_values):
+        return None
+    value = latest[column]
+    if pd.isna(value):
+        return None
+    numeric = float(value)
+    if percent:
+        return _pct(numeric)
+    if round_to_int:
+        return round(numeric)
+    return round(numeric, digits)
+
+
+def _fetch_finnhub_daily_bars(ticker: str, start: str) -> Any:
+    """Fetch daily OHLCV bars from Finnhub and normalize them to a DataFrame."""
+    pd, _ = _load_analysis_dependencies()
+    period1, period2 = _history_period_bounds(start)
+    response = SESSION.get(
+        FINNHUB_CANDLE_URL,
         params={
-            "adjusted": "true",
-            "sort": "asc",
-            "limit": 5000,
-            "apiKey": api_key,
+            "symbol": ticker.upper(),
+            "resolution": "D",
+            "from": period1,
+            "to": period2,
+            "token": _require_env("FINNHUB_API_KEY"),
         },
         timeout=REQUEST_TIMEOUT,
     )
 
     if response.status_code != 200:
-        detail = ""
-        with contextlib.suppress(ValueError):
-            payload = response.json()
-            detail = payload.get("error") or payload.get("message") or ""
+        detail = _response_detail(response, "error")
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(f"Finnhub candle request failed with status {response.status_code}{suffix}")
+
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError(f"Finnhub returned an invalid candle payload for {ticker.upper()}")
+
+    status = payload.get("s")
+    if status == "no_data":
+        raise ValueError(f"Finnhub returned no daily bars for {ticker.upper()}")
+    if status != "ok":
+        detail = payload.get("error") or status or "unknown error"
+        raise RuntimeError(f"Finnhub returned an error for {ticker.upper()}: {detail}")
+
+    return _normalize_daily_bars(
+        pd,
+        ticker,
+        source="Finnhub",
+        timestamps=payload.get("t") or [],
+        open_values=payload.get("o"),
+        high_values=payload.get("h"),
+        low_values=payload.get("l"),
+        close_values=payload.get("c"),
+        volume_values=payload.get("v"),
+    )
+
+
+def _fetch_polygon_daily_bars(ticker: str, start: str) -> Any:
+    """Fetch daily OHLCV bars from Polygon and normalize them to a DataFrame."""
+    pd, _ = _load_analysis_dependencies()
+    end_date = datetime.now(UTC).date().isoformat()
+    response = SESSION.get(
+        POLYGON_AGGS_URL.format(
+            ticker=ticker.upper(),
+            from_date=start,
+            to_date=end_date,
+        ),
+        params={
+            "adjusted": "true",
+            "sort": "asc",
+            "limit": 5000,
+            "apiKey": _require_env("POLYGON_API_KEY"),
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    if response.status_code != 200:
+        detail = _response_detail(response, "error", "message", "status")
         suffix = f": {detail}" if detail else ""
         raise RuntimeError(f"Polygon request failed with status {response.status_code}{suffix}")
 
     payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError(f"Polygon returned an invalid aggregate payload for {ticker.upper()}")
+
     results = payload.get("results") or []
+    status = payload.get("status")
+    if status not in (None, "OK") and not results:
+        detail = payload.get("error") or payload.get("message") or status or "unknown error"
+        raise RuntimeError(f"Polygon returned an error for {ticker.upper()}: {detail}")
     if not results:
         raise ValueError(f"Polygon returned no daily bars for {ticker.upper()}")
 
-    frame = pd.DataFrame(results)
-    required = {"o", "h", "l", "c", "v", "t"}
-    if not required.issubset(frame.columns):
-        raise ValueError(f"Polygon daily bars for {ticker.upper()} are missing expected fields")
+    return _normalize_daily_bars(
+        pd,
+        ticker,
+        source="Polygon",
+        timestamps=[int(item.get("t", 0)) / 1000 for item in results],
+        open_values=[item.get("o") for item in results],
+        high_values=[item.get("h") for item in results],
+        low_values=[item.get("l") for item in results],
+        close_values=[item.get("c") for item in results],
+        volume_values=[item.get("v") for item in results],
+    )
 
-    frame = frame.rename(
-        columns={
-            "o": "Open",
-            "h": "High",
-            "l": "Low",
-            "c": "Close",
-            "v": "Volume",
-            "vw": "VWAP",
-            "n": "Transactions",
-        }
+
+def _fetch_finnhub_quote(ticker: str) -> dict[str, Any]:
+    """Fetch a realtime quote snapshot from Finnhub."""
+    response = SESSION.get(
+        FINNHUB_QUOTE_URL,
+        params={
+            "symbol": ticker.upper(),
+            "token": _require_env("FINNHUB_API_KEY"),
+        },
+        timeout=REQUEST_TIMEOUT,
     )
-    frame.index = (
-        pd.to_datetime(frame["t"], unit="ms", utc=True)
-        .dt.tz_convert(NEW_YORK_TZ)
-        .dt.tz_localize(None)
-        .dt.normalize()
+
+    if response.status_code != 200:
+        detail = _response_detail(response, "error")
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(f"Finnhub request failed with status {response.status_code}{suffix}")
+
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError(f"Finnhub returned an invalid quote payload for {ticker.upper()}")
+    return payload
+
+
+def _quote_to_price_frame(ticker: str, quote: dict[str, Any], *, warning: str | None = None) -> Any:
+    """Build a minimal one-row price frame from a realtime quote payload."""
+    pd, _ = _load_analysis_dependencies()
+    snapshot = _quote_session_snapshot(ticker, quote)
+
+    frame = pd.DataFrame(
+        {
+            "Open": [snapshot["open"]],
+            "High": [snapshot["high"]],
+            "Low": [snapshot["low"]],
+            "Close": [snapshot["close"]],
+            "Volume": [0.0],
+        },
+        index=pd.DatetimeIndex([snapshot["session_date"]]),
     )
-    columns = ["Open", "High", "Low", "Close", "Volume"]
-    if "VWAP" in frame.columns:
-        columns.append("VWAP")
-    if "Transactions" in frame.columns:
-        columns.append("Transactions")
-    frame = frame[columns].sort_index()
-    frame = frame[~frame.index.duplicated(keep="last")]
+    if warning:
+        frame.attrs["data_warning"] = warning
     return frame
+
+
+def _merge_realtime_quote(price_df: Any, quote: dict[str, Any]) -> Any:
+    """Overlay Finnhub realtime quote onto the latest daily bar set."""
+    pd, _ = _load_analysis_dependencies()
+    try:
+        snapshot = _quote_session_snapshot(None, quote)
+    except RuntimeError:
+        return price_df
+
+    session_date = snapshot["session_date"]
+
+    if session_date in price_df.index:
+        merged = price_df.copy()
+    else:
+        merged = pd.concat(
+            [
+                price_df,
+                pd.DataFrame(index=[session_date], columns=price_df.columns, dtype=float),
+            ]
+        )
+
+    existing = merged.loc[session_date]
+
+    merged.loc[session_date, "Open"] = snapshot["open"] if snapshot["open"] is not None else existing.get("Open")
+    merged.loc[session_date, "Close"] = snapshot["close"]
+    merged.loc[session_date, "High"] = max(
+        value
+        for value in (existing.get("High"), snapshot["high"], snapshot["close"], snapshot["open"])
+        if value is not None and not pd.isna(value)
+    )
+    merged.loc[session_date, "Low"] = min(
+        value
+        for value in (existing.get("Low"), snapshot["low"], snapshot["close"], snapshot["open"])
+        if value is not None and not pd.isna(value)
+    )
+
+    return merged.sort_index()
+
+
+def _fetch_price_frame(ticker: str, start: str) -> Any:
+    """Fetch historical daily bars and overlay the latest realtime quote."""
+    history_error: Exception | None = None
+    try:
+        price_df = _fetch_polygon_daily_bars(ticker, start)
+    except Exception as polygon_exc:
+        history_error = polygon_exc
+        try:
+            price_df = _fetch_finnhub_daily_bars(ticker, start)
+        except Exception as fallback_exc:
+            history_error = fallback_exc
+            price_df = None
+    if price_df is None:
+        quote = _fetch_finnhub_quote(ticker)
+        warning = (
+            "历史日线暂不可用，当前结果仅基于实时 quote，技术指标大多不可用。"
+            f" 最后一次历史数据错误: {history_error}"
+        )
+        return _quote_to_price_frame(ticker, quote, warning=warning)
+    try:
+        quote = _fetch_finnhub_quote(ticker)
+    except Exception as quote_exc:
+        price_df = price_df.copy()
+        price_df.attrs["data_warning"] = (
+            "实时 quote 暂不可用，当前结果仅基于历史日线。"
+            f" 最新 quote 错误: {quote_exc}"
+        )
+        return price_df
+    return _merge_realtime_quote(price_df, quote)
 
 
 def _classify_trend(latest: Any, prev: Any, pd: Any) -> str | None:
@@ -403,6 +677,8 @@ def _analyze_price_frame(ticker: str, price_df: Any) -> dict[str, object]:
         if "Transactions" in price_df.columns
         else pd.Series(index=price_df.index, dtype=float)
     )
+    has_vwap = not vwap.dropna().empty
+    has_transactions = not transactions.dropna().empty
     history_days = len(price_df)
 
     ma20 = vbt.MA.run(close, MA_SHORT).ma
@@ -482,40 +758,61 @@ def _analyze_price_frame(ticker: str, price_df: Any) -> dict[str, object]:
     elif history_days < HIGH_52W_WINDOW:
         history_warning = "历史短于 252 个交易日，52 周最高价回撤改用样本期最高价计算。"
 
-    ma20_value = None if history_days < MA_SHORT or pd.isna(latest["ma20"]) else round(float(latest["ma20"]), 2)
-    ma50_value = None if history_days < MA_LONG or pd.isna(latest["ma50"]) else round(float(latest["ma50"]), 2)
-    ema12_value = None if history_days < EMA_FAST or pd.isna(latest["ema12"]) else round(float(latest["ema12"]), 2)
-    ema26_value = None if history_days < EMA_SLOW or pd.isna(latest["ema26"]) else round(float(latest["ema26"]), 2)
-    dev_ma20_value = None if ma20_value is None or pd.isna(latest["dev_ma20"]) else _pct(float(latest["dev_ma20"]))
-    dev_ma50_value = None if ma50_value is None or pd.isna(latest["dev_ma50"]) else _pct(float(latest["dev_ma50"]))
-    rsi14_value = None if history_days < RSI_WINDOW or pd.isna(latest["rsi14"]) else round(float(latest["rsi14"]), 2)
-    atr_pct_value = None if history_days < ATR_WINDOW or pd.isna(latest["atr_pct"]) else _pct(float(latest["atr_pct"]))
-    macd_value = None if history_days < EMA_SLOW or pd.isna(latest["macd"]) else round(float(latest["macd"]), 4)
-    macd_signal_value = None if history_days < EMA_SLOW or pd.isna(latest["macd_signal"]) else round(float(latest["macd_signal"]), 4)
-    macd_hist_value = None if history_days < EMA_SLOW or pd.isna(latest["macd_hist"]) else round(float(latest["macd_hist"]), 4)
-    avg_volume_20d_value = None
-    rvol_value = None
-    if history_days >= VOLUME_WINDOW and pd.notna(latest["avg_volume_20d"]):
-        avg_volume_20d_value = round(float(latest["avg_volume_20d"]))
-    if history_days >= VOLUME_WINDOW and pd.notna(latest["rvol"]):
-        rvol_value = round(float(latest["rvol"]), 2)
-    bb_upper_value = None if history_days < BB_WINDOW or pd.isna(latest["bb_upper"]) else round(float(latest["bb_upper"]), 2)
-    bb_middle_value = None if history_days < BB_WINDOW or pd.isna(latest["bb_middle"]) else round(float(latest["bb_middle"]), 2)
-    bb_lower_value = None if history_days < BB_WINDOW or pd.isna(latest["bb_lower"]) else round(float(latest["bb_lower"]), 2)
-    bb_width_value = None if history_days < BB_WINDOW or pd.isna(latest["bb_width"]) else _pct(float(latest["bb_width"]))
-    bb_percent_b_value = None if history_days < BB_WINDOW or pd.isna(latest["bb_percent_b"]) else round(float(latest["bb_percent_b"]), 4)
-    drawdown_52w_value = None if pd.isna(latest["drawdown_from_52w_high"]) else _pct(float(latest["drawdown_from_52w_high"]))
-    max_drawdown_20d_value = None if history_days < DRAWDOWN_WINDOW or pd.isna(latest["max_drawdown_20d"]) else _pct(float(latest["max_drawdown_20d"]))
-    adx14_value = None if history_days < ADX_WINDOW or pd.isna(latest["adx14"]) else round(float(latest["adx14"]), 2)
-    obv_value = None if pd.isna(latest["obv"]) else round(float(latest["obv"]))
-    stochrsi_k_value = None if history_days < (RSI_WINDOW + STOCH_RSI_WINDOW + STOCH_RSI_SMOOTH_K - 1) or pd.isna(latest["stochrsi_k"]) else round(float(latest["stochrsi_k"]), 2)
-    stochrsi_d_value = None if history_days < (RSI_WINDOW + STOCH_RSI_WINDOW + STOCH_RSI_SMOOTH_K + STOCH_RSI_SMOOTH_D - 2) or pd.isna(latest["stochrsi_d"]) else round(float(latest["stochrsi_d"]), 2)
-    williams_r14_value = None if history_days < RSI_WINDOW or pd.isna(latest["williams_r14"]) else round(float(latest["williams_r14"]), 2)
-    cci20_value = None if history_days < CCI_WINDOW or pd.isna(latest["cci20"]) else round(float(latest["cci20"]), 2)
-    cmf20_value = None if history_days < CMF_WINDOW or pd.isna(latest["cmf20"]) else round(float(latest["cmf20"]), 4)
-    mfi14_value = None if history_days < MFI_WINDOW or pd.isna(latest["mfi14"]) else round(float(latest["mfi14"]), 2)
-    vwap_value = None if pd.isna(latest["vwap"]) else round(float(latest["vwap"]), 2)
-    transactions_value = None if pd.isna(latest["transactions"]) else round(float(latest["transactions"]))
+    data_warning = price_df.attrs.get("data_warning")
+    if data_warning:
+        history_warning = f"{history_warning} {data_warning}".strip() if history_warning else str(data_warning)
+
+    def metric(
+        column: str,
+        *,
+        min_history: int = 0,
+        digits: int = 2,
+        percent: bool = False,
+        requires: object | None = None,
+        round_to_int: bool = False,
+    ) -> float | int | None:
+        if history_days < min_history:
+            return None
+        return _metric_value(
+            pd,
+            latest,
+            column,
+            digits=digits,
+            percent=percent,
+            requires=requires,
+            round_to_int=round_to_int,
+        )
+
+    ma20_value = metric("ma20", min_history=MA_SHORT)
+    ma50_value = metric("ma50", min_history=MA_LONG)
+    ema12_value = metric("ema12", min_history=EMA_FAST)
+    ema26_value = metric("ema26", min_history=EMA_SLOW)
+    dev_ma20_value = metric("dev_ma20", percent=True, requires=ma20_value)
+    dev_ma50_value = metric("dev_ma50", percent=True, requires=ma50_value)
+    rsi14_value = metric("rsi14", min_history=RSI_WINDOW)
+    atr_pct_value = metric("atr_pct", min_history=ATR_WINDOW, percent=True)
+    macd_value = metric("macd", min_history=EMA_SLOW, digits=4)
+    macd_signal_value = metric("macd_signal", min_history=EMA_SLOW, digits=4)
+    macd_hist_value = metric("macd_hist", min_history=EMA_SLOW, digits=4)
+    avg_volume_20d_value = metric("avg_volume_20d", min_history=VOLUME_WINDOW, round_to_int=True)
+    rvol_value = metric("rvol", min_history=VOLUME_WINDOW)
+    bb_upper_value = metric("bb_upper", min_history=BB_WINDOW)
+    bb_middle_value = metric("bb_middle", min_history=BB_WINDOW)
+    bb_lower_value = metric("bb_lower", min_history=BB_WINDOW)
+    bb_width_value = metric("bb_width", min_history=BB_WINDOW, percent=True)
+    bb_percent_b_value = metric("bb_percent_b", min_history=BB_WINDOW, digits=4)
+    drawdown_52w_value = metric("drawdown_from_52w_high", percent=True)
+    max_drawdown_20d_value = metric("max_drawdown_20d", min_history=DRAWDOWN_WINDOW, percent=True)
+    adx14_value = metric("adx14", min_history=ADX_WINDOW)
+    obv_value = metric("obv", round_to_int=True)
+    stochrsi_k_value = metric("stochrsi_k", min_history=RSI_WINDOW + STOCH_RSI_WINDOW + STOCH_RSI_SMOOTH_K - 1)
+    stochrsi_d_value = metric("stochrsi_d", min_history=RSI_WINDOW + STOCH_RSI_WINDOW + STOCH_RSI_SMOOTH_K + STOCH_RSI_SMOOTH_D - 2)
+    williams_r14_value = metric("williams_r14", min_history=RSI_WINDOW)
+    cci20_value = metric("cci20", min_history=CCI_WINDOW)
+    cmf20_value = metric("cmf20", min_history=CMF_WINDOW, digits=4)
+    mfi14_value = metric("mfi14", min_history=MFI_WINDOW)
+    vwap_value = metric("vwap")
+    transactions_value = metric("transactions", round_to_int=True)
 
     latest_for_classification = {
         "close": latest["close"],
@@ -531,8 +828,8 @@ def _analyze_price_frame(ticker: str, price_df: Any) -> dict[str, object]:
         "ma20": prev["ma20"] if len(metrics) >= 2 and history_days >= MA_SHORT else pd.NA,
         "ma50": prev["ma50"] if len(metrics) >= 2 and history_days >= MA_LONG else pd.NA,
     }
-    trend = _classify_trend(latest_for_classification, prev_for_classification, pd)
-    risk = _classify_risk(latest_for_classification, trend, pd)
+    trend = None if data_warning else _classify_trend(latest_for_classification, prev_for_classification, pd)
+    risk = None if data_warning else _classify_risk(latest_for_classification, trend, pd)
 
     return {
         "ticker": ticker,
@@ -571,7 +868,9 @@ def _analyze_price_frame(ticker: str, price_df: Any) -> dict[str, object]:
         "cmf20": cmf20_value,
         "mfi14": mfi14_value,
         "vwap": vwap_value,
+        "show_vwap": has_vwap,
         "transactions": transactions_value,
+        "show_transactions": has_transactions,
         "trend": trend,
         "risk": risk,
     }
@@ -580,7 +879,7 @@ def _analyze_price_frame(ticker: str, price_df: Any) -> dict[str, object]:
 def _print_quote(item: dict[str, object]) -> None:
     """Render the quote snapshot."""
     console.print(f"[{item['ticker']}] {item['date']}")
-    console.print(f"收盘价: {_format_metric(item['close'])}")
+    console.print(f"最新价: {_format_metric(item['close'])}")
     console.print(f"当日涨跌幅: {_format_metric(item['day_change_pct'], suffix='%')}")
     console.print(f"MA20: {_format_metric(item.get('ma20'))}")
     console.print(f"MA50: {_format_metric(item.get('ma50'))}")
@@ -617,11 +916,13 @@ def _print_quote(item: dict[str, object]) -> None:
     console.print(f"CCI20: {_format_metric(item.get('cci20'))}")
     console.print(f"CMF20: {_format_metric(item.get('cmf20'), digits=4)}")
     console.print(f"MFI14: {_format_metric(item.get('mfi14'))}")
-    console.print(f"VWAP: {_format_metric(item.get('vwap'))}")
-    transactions_value = (
-        f"{int(item['transactions']):,}" if item.get("transactions") is not None else "暂无"
-    )
-    console.print(f"成交笔数: {transactions_value}")
+    if item.get("show_vwap"):
+        console.print(f"VWAP: {_format_metric(item.get('vwap'))}")
+    if item.get("show_transactions"):
+        transactions_value = (
+            f"{int(item['transactions']):,}" if item.get("transactions") is not None else "暂无"
+        )
+        console.print(f"成交笔数: {transactions_value}")
     console.print(f"趋势状态: {item.get('trend') or '暂无'}")
     console.print(f"风险标签: {item.get('risk') or '暂无'}")
     if item.get("history_warning"):
@@ -639,7 +940,7 @@ def stock_quote(
     try:
         with console.status(f"[bold green]正在获取 {normalized_ticker} 行情并计算技术指标..."):
             resolved_start = _quote_start_from_lookback(lookback_days)
-            price_df = _fetch_polygon_daily_bars(normalized_ticker, resolved_start)
+            price_df = _fetch_price_frame(normalized_ticker, resolved_start)
             item = _analyze_price_frame(normalized_ticker, price_df)
     except Exception as exc:
         console.print(f"[red]stock quote 执行失败: {exc}[/red]")

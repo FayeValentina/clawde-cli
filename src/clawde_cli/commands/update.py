@@ -89,7 +89,7 @@ def _get_current_version() -> str:
             check=True,
         )
         return result.stdout.strip()
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, FileNotFoundError):
         return "unknown"
 
 
@@ -242,7 +242,7 @@ def update(
         return
 
     openclaw_ready, openclaw_error = _probe_openclaw()
-    if not openclaw_ready:
+    if status_only and not openclaw_ready:
         console.print(
             Panel(
                 f"[bold red]OpenClaw is unavailable[/bold red]\n{openclaw_error}",
@@ -252,19 +252,12 @@ def update(
         )
         raise typer.Exit(code=1)
 
-    npm_ready, npm_error = _probe_npm()
-    if not npm_ready:
-        console.print(
-            Panel(
-                f"[bold red]npm is unavailable[/bold red]\n{npm_error}",
-                title="Error",
-                border_style="red",
-            )
-        )
-        raise typer.Exit(code=1)
-
     current_version = _get_current_version()
-    gateway_state, gateway_details = _build_gateway_status_summary()
+    if openclaw_ready:
+        gateway_state, gateway_details = _build_gateway_status_summary()
+    else:
+        gateway_state = "unavailable"
+        gateway_details = openclaw_error or "OpenClaw command is unavailable."
 
     if status_only:
         console.print(
@@ -279,6 +272,17 @@ def update(
         )
         return
 
+    npm_ready, npm_error = _probe_npm()
+    if not npm_ready:
+        console.print(
+            Panel(
+                f"[bold red]npm is unavailable[/bold red]\n{npm_error}",
+                title="Error",
+                border_style="red",
+            )
+        )
+        raise typer.Exit(code=1)
+
     console.print(
         Panel(
             f"[bold cyan]Current version:[/bold cyan] {current_version}\n"
@@ -286,6 +290,16 @@ def update(
             "The gateway LaunchAgent will be explicitly reinstalled and verified.",
             title="OpenClaw Update",
             border_style="cyan",
+            )
+        )
+
+    if not openclaw_ready:
+        console.print(
+            Panel(
+                "[yellow]OpenClaw is currently unavailable, but the updater will try to repair it.[/yellow]\n"
+                f"{openclaw_error}",
+                title="Recovery Mode",
+                border_style="yellow",
             )
         )
 
@@ -349,8 +363,7 @@ def update(
                     border_style="green",
                 )
             )
-        else:
-            console.print("\n[yellow]→ Waiting for gateway service to become ready...[/yellow]")
+        elif success:
             if _wait_for_gateway(timeout=30):
                 console.print(
                     Panel(
@@ -371,6 +384,18 @@ def update(
                         border_style="yellow",
                     )
                 )
+        else:
+            console.print(
+                Panel(
+                    "[yellow]⚠ Skipping readiness wait because gateway reinstall did not succeed[/yellow]\n"
+                    "Please fix the service first:\n"
+                    "  openclaw gateway install\n"
+                    "Then verify with:\n"
+                    "  openclaw gateway status",
+                    title="Verification Skipped",
+                    border_style="yellow",
+                )
+            )
 
     except FileNotFoundError:
         console.print(

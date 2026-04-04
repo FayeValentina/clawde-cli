@@ -268,18 +268,22 @@ def _check_env(verbose_values: bool = False) -> CheckResult:
         "no_proxy",
     ]
     ssl_keys = ["SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"]
+    app_keys = ["FINNHUB_API_KEY"]
 
     proxy_values = {key: os.getenv(key) for key in proxy_keys if os.getenv(key)}
     ssl_values = {key: os.getenv(key) for key in ssl_keys if os.getenv(key)}
+    app_values = {key: os.getenv(key) for key in app_keys if os.getenv(key)}
 
     details: dict[str, Any] = {
         "home": str(Path.home()),
         "proxy_env": {key: key in proxy_values for key in proxy_keys},
         "ssl_env": {key: key in ssl_values for key in ssl_keys},
+        "app_env": {key: key in app_values for key in app_keys},
     }
     if verbose_values:
         details["proxy_env_values"] = {key: _mask_env_value(value) for key, value in proxy_values.items()}
         details["ssl_env_values"] = {key: _mask_env_value(value) for key, value in ssl_values.items()}
+        details["app_env_values"] = {key: _mask_env_value(value) for key, value in app_values.items()}
     return _result("environment", "info", "Environment variable presence captured", details, started)
 
 

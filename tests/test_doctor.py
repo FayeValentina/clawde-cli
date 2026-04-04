@@ -66,6 +66,7 @@ def test_doctor_strict_passes_when_no_warnings(monkeypatch, tmp_path):
 def test_doctor_env_default_hides_values(monkeypatch, tmp_path):
     _configure_doctor_paths(monkeypatch, tmp_path, create_children=True)
     monkeypatch.setenv("HTTP_PROXY", "http://user:token@proxy.local:8080")
+    monkeypatch.setenv("FINNHUB_API_KEY", "demo-key")
 
     result = runner.invoke(app, ["doctor", "--json", "--no-network"])
 
@@ -74,12 +75,15 @@ def test_doctor_env_default_hides_values(monkeypatch, tmp_path):
     checks = {item["id"]: item for item in payload["results"]}
     env_details = checks["environment"]["details"]
     assert env_details["proxy_env"]["HTTP_PROXY"] is True
+    assert env_details["app_env"]["FINNHUB_API_KEY"] is True
     assert "proxy_env_values" not in env_details
+    assert "app_env_values" not in env_details
 
 
 def test_doctor_env_verbose_masks_values(monkeypatch, tmp_path):
     _configure_doctor_paths(monkeypatch, tmp_path, create_children=True)
     monkeypatch.setenv("HTTP_PROXY", "http://user:token@proxy.local:8080")
+    monkeypatch.setenv("FINNHUB_API_KEY", "demo-key")
 
     result = runner.invoke(app, ["doctor", "--json", "--no-network", "--verbose-env"])
 
@@ -88,4 +92,6 @@ def test_doctor_env_verbose_masks_values(monkeypatch, tmp_path):
     checks = {item["id"]: item for item in payload["results"]}
     env_details = checks["environment"]["details"]
     masked = env_details["proxy_env_values"]["HTTP_PROXY"]
+    app_masked = env_details["app_env_values"]["FINNHUB_API_KEY"]
     assert masked != "http://user:token@proxy.local:8080"
+    assert app_masked != "demo-key"
