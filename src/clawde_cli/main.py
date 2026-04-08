@@ -15,6 +15,7 @@ from clawde_cli.commands.sync import app as sync_app
 from clawde_cli.commands.system import app as system_app
 from clawde_cli.commands.update import app as update_app
 from clawde_cli.commands.upgrade import app as upgrade_app
+from clawde_cli.commands.usage import app as usage_app
 from clawde_cli.commands.weather import app as weather_app
 
 app = typer.Typer(
@@ -36,6 +37,7 @@ app.add_typer(log_app, name="log", help="Event log operations")
 app.add_typer(update_app, name="update", help="Safe OpenClaw update wrapper")
 app.add_typer(upgrade_app, name="upgrade", help="Upgrade the global Clawde CLI from the original local workspace")
 app.add_typer(sync_app, name="sync", help="Refresh Gemini OAuth authentication")
+app.add_typer(usage_app, name="usage", help="Show Codex quota usage")
 app.command(name="search", help="Search session utterances")(search.search_command)
 
 
