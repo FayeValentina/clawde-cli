@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import mimetypes
 import os
 from datetime import datetime
@@ -119,9 +120,21 @@ def _request_image_generation(api_key: str, payload: dict[str, Any]) -> dict[str
 
 def _extract_text_parts(response_data: dict[str, Any]) -> list[str]:
     texts: list[str] = []
-    for candidate in response_data.get("candidates", []):
+    candidates = response_data.get("candidates", [])
+    if not isinstance(candidates, list):
+        return texts
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
         content = candidate.get("content", {})
-        for part in content.get("parts", []):
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts", [])
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
             text = part.get("text")
             if text:
                 texts.append(text)
@@ -130,11 +143,23 @@ def _extract_text_parts(response_data: dict[str, Any]) -> list[str]:
 
 def _extract_image_parts(response_data: dict[str, Any]) -> list[dict[str, str]]:
     images: list[dict[str, str]] = []
-    for candidate in response_data.get("candidates", []):
+    candidates = response_data.get("candidates", [])
+    if not isinstance(candidates, list):
+        return images
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
         content = candidate.get("content", {})
-        for part in content.get("parts", []):
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts", [])
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
             inline_data = part.get("inlineData") or part.get("inline_data")
-            if not inline_data:
+            if not isinstance(inline_data, dict):
                 continue
             data = inline_data.get("data")
             mime_type = inline_data.get("mimeType") or inline_data.get("mime_type")
@@ -155,16 +180,12 @@ def _extension_for_mime_type(mime_type: str) -> str:
     return ".bin"
 
 
-def _default_output_dir() -> Path:
-    return Path.cwd()
-
-
 def _resolve_output_paths(output: Path | None, images: list[dict[str, str]]) -> list[Path]:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     total = len(images)
 
     if output is None:
-        directory = _default_output_dir()
+        directory = Path.cwd()
         directory.mkdir(parents=True, exist_ok=True)
         paths = []
         for index, image in enumerate(images, start=1):
@@ -172,6 +193,11 @@ def _resolve_output_paths(output: Path | None, images: list[dict[str, str]]) -> 
             serial = f"-{index}" if total > 1 else ""
             paths.append(directory / f"{DEFAULT_FILENAME_PREFIX}-{timestamp}{serial}{suffix}")
         return paths
+
+    if output.suffix and total > 1:
+        raise ValueError(
+            "When multiple images are returned, --output must be a directory path, not a file path."
+        )
 
     if output.suffix and total == 1:
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -187,8 +213,11 @@ def _resolve_output_paths(output: Path | None, images: list[dict[str, str]]) -> 
 
 def _save_images(images: list[dict[str, str]], output: Path | None) -> list[Path]:
     paths = _resolve_output_paths(output, images)
-    for image, path in zip(images, paths, strict=True):
-        raw = base64.b64decode(image["data"])
+    for index, (image, path) in enumerate(zip(images, paths, strict=True), start=1):
+        try:
+            raw = base64.b64decode(image["data"], validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise RuntimeError(f"Gemini returned invalid base64 image data at index {index}.") from exc
         path.write_bytes(raw)
     return paths
 

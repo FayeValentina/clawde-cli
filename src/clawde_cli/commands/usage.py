@@ -147,6 +147,8 @@ def _window_label(limit_window_seconds: object, *, secondary: bool = False) -> s
     if not isinstance(limit_window_seconds, (int, float)) or limit_window_seconds <= 0:
         return "Window"
     hours = int(limit_window_seconds // 3600)
+    if hours == 0:
+        return "<1h"
     if secondary and hours >= 168:
         return "Week"
     if hours >= 24:
@@ -181,7 +183,7 @@ def _format_rate_limit_section(title: str, payload: dict[str, Any]) -> list[str]
         status = "allowed" if allowed else "blocked"
         if isinstance(limit_reached, bool) and limit_reached:
             status += " · limit reached"
-        lines.append(f"状态: {status}")
+        lines.append(f"Status: {status}")
 
     primary = payload.get("primary_window")
     secondary = payload.get("secondary_window")
@@ -190,7 +192,7 @@ def _format_rate_limit_section(title: str, payload: dict[str, Any]) -> list[str]
     if isinstance(secondary, dict):
         lines.append(_format_window_line(secondary, secondary=True))
     if len(lines) == 1:
-        lines.append("暂无窗口信息")
+        lines.append("No window information available")
     return lines
 
 
