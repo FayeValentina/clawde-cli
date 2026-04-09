@@ -7,6 +7,7 @@ from rich.panel import Panel
 from clawde_cli.commands import search
 from clawde_cli.commands.doctor import app as doctor_app
 from clawde_cli.commands.extract import app as extract_app
+from clawde_cli.commands.generate import generate_command
 from clawde_cli.commands.log import app as log_app
 from clawde_cli.commands.memory import app as memory_app
 from clawde_cli.commands.run import app as run_app
@@ -31,6 +32,7 @@ app.add_typer(weather_app, name="weather", help="Weather queries")
 app.add_typer(memory_app, name="memory", help="Memory log operations")
 app.add_typer(stock_app, name="stock", help="Stock quote and technical snapshot")
 app.add_typer(extract_app, name="extract", help="Extract session utterances")
+app.command(name="generate", help="Generate or edit images with Nano Banana")(generate_command)
 app.add_typer(doctor_app, name="doctor", help="Environment diagnostics")
 app.add_typer(run_app, name="run", help="Reliable command execution")
 app.add_typer(log_app, name="log", help="Event log operations")
