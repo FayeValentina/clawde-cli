@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import math
 import os
+from collections.abc import Sized
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -105,6 +107,8 @@ def _rolling_max_drawdown(close: Any, window: int) -> Any:
 def _format_metric(value: object, *, suffix: str = "", digits: int = 2) -> str:
     """Format numeric metrics while tolerating missing values."""
     if value is None:
+        return "暂无"
+    if isinstance(value, float) and math.isnan(value):
         return "暂无"
     if isinstance(value, float):
         return f"{value:.{digits}f}{suffix}"
@@ -238,9 +242,10 @@ def _compute_mfi(high: Any, low: Any, close: Any, volume: Any, window: int, pd: 
     negative_flow = raw_money_flow.where(direction < 0, 0.0)
     positive_sum = positive_flow.rolling(window, min_periods=window).sum()
     negative_sum = negative_flow.rolling(window, min_periods=window).sum().abs()
-    money_ratio = positive_sum / negative_sum
+    money_ratio = positive_sum / negative_sum.where(negative_sum != 0, pd.NA)
     mfi = 100 - (100 / (1 + money_ratio))
-    return mfi.where(negative_sum != 0, pd.NA)
+    mfi = mfi.where(negative_sum != 0, 100.0)
+    return mfi.where((positive_sum + negative_sum) != 0, pd.NA)
 
 
 def _history_period_bounds(start: str) -> tuple[int, int]:
@@ -275,7 +280,9 @@ def _normalize_daily_bars(
     volume_values: Any,
 ) -> Any:
     """Normalize raw OHLCV arrays into the shared price frame shape."""
-    if not timestamps:
+    if timestamps is None:
+        raise ValueError(f"{source} returned no daily bars for {ticker.upper()}")
+    if isinstance(timestamps, Sized) and len(timestamps) == 0:
         raise ValueError(f"{source} returned no daily bars for {ticker.upper()}")
 
     frame = pd.DataFrame(
