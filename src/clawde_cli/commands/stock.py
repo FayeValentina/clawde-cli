@@ -936,7 +936,6 @@ def _print_quote(item: dict[str, object]) -> None:
         console.print(f"提示: {item['history_warning']}")
 
 
-@app.command("quote")
 def stock_quote(
     ticker: str = typer.Argument(..., help="股票代码"),
     lookback_days: int = typer.Option(QUOTE_LOOKBACK_DAYS, min=30, help="技术分析价格回看天数"),

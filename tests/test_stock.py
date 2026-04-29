@@ -73,7 +73,7 @@ def test_stock_quote_prints_ticker_snapshot(monkeypatch):
         },
     )
 
-    result = runner.invoke(app, ["stock", "quote", "nvda"])
+    result = runner.invoke(app, ["stock", "nvda"])
 
     assert result.exit_code == 0
     assert captured["ticker"] == "NVDA"
@@ -153,7 +153,7 @@ def test_stock_quote_cli_uses_lookback_days(monkeypatch):
         },
     )
 
-    result = runner.invoke(app, ["stock", "quote", "nvda", "--lookback-days", "300"])
+    result = runner.invoke(app, ["stock", "nvda", "--lookback-days", "300"])
 
     assert result.exit_code == 0
     assert captured["ticker"] == "NVDA"
@@ -654,7 +654,7 @@ def test_stock_quote_hides_vwap_and_transactions_when_unavailable(monkeypatch):
         },
     )
 
-    result = runner.invoke(app, ["stock", "quote", "nvda"])
+    result = runner.invoke(app, ["stock", "nvda"])
 
     assert result.exit_code == 0
     assert "VWAP:" not in result.stdout
@@ -662,7 +662,7 @@ def test_stock_quote_hides_vwap_and_transactions_when_unavailable(monkeypatch):
 
 
 def test_stock_cli_rejects_invalid_numeric_options():
-    quote_result = runner.invoke(app, ["stock", "quote", "nvda", "--lookback-days", "0"])
+    quote_result = runner.invoke(app, ["stock", "nvda", "--lookback-days", "0"])
 
     assert quote_result.exit_code != 0
 
